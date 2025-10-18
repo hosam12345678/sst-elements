@@ -24,7 +24,11 @@ librdmaNic_la_SOURCES = \
 	rdmaNicSendEntry.h \
 	rdmaNicMemRequest.h \
 	rdmaNicNetworkEvent.h \
-	rdmaNicTree.h
+	rdmaNicTree.h \
+	computeServer.cc \
+	computeServer.h \
+	memoryServer.cc \
+	memoryServer.h
 
 EXTRA_DIST = \
 	tests/memory.py \
@@ -33,6 +37,8 @@ EXTRA_DIST = \
 	tests/runVanadis.py \
 	tests/vanadisBlock.py \
 	tests/testsuite_default_rdmaNic.py \
+	tests/test_sherman_compute_memory.py \
+	tests/test_sherman_units.py \
 	tests/vanadisOS.py \
 	tests/msglen.txt \
 	tests/app/rdma/Makefile \
