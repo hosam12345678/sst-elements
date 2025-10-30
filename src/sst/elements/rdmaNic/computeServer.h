@@ -41,6 +41,23 @@ struct WorkloadOp {
     uint64_t node_id;  // Which compute node issued this
 };
 
+// Async operation tracking - state machine for multi-step operations
+struct AsyncOperation {
+    enum Type { TRAVERSAL, INSERT, SEARCH, DELETE };
+    
+    Type type;                          // What operation is this?
+    uint64_t key;                       // Key being operated on
+    uint64_t value;                     // Value (for inserts)
+    uint32_t current_level;             // Which tree level we're at
+    uint64_t current_address;           // Current node address
+    std::vector<BTreeNode> path;        // Nodes visited so far (for splits)
+    SimTime_t start_time;               // When operation started
+    
+    // Constructor
+    AsyncOperation() : type(TRAVERSAL), key(0), value(0), current_level(0), 
+                      current_address(0), start_time(0) {}
+};
+
 // B+tree node structure (dynamic fanout)
 struct BTreeNode {
     std::vector<uint64_t> keys;        // Keys (size = fanout)
@@ -126,15 +143,10 @@ public:
     void handleMemoryEvent(SST::Interfaces::StandardMem::Request* req);
 
     // ===== Application-level B+tree operations =====
-    // These implement B+tree logic using RDMA operations below
-    void btree_insert(uint64_t key, uint64_t value);
-    void btree_search(uint64_t key);
-    void btree_delete(uint64_t key);
-
-    // ===== Low-level RDMA operations =====
-    // These issue actual RDMA requests to memory servers
-    void rdma_read(uint64_t remote_address, size_t size, uint64_t local_buffer);
-    void rdma_write(uint64_t remote_address, void* data, size_t size);
+    // These initiate async B+tree operations
+    void btree_insert_async(uint64_t key, uint64_t value);
+    void btree_search_async(uint64_t key);
+    void btree_delete_async(uint64_t key);
 
     // Workload generation
     void generate_workload();
@@ -160,23 +172,25 @@ private:
     std::uniform_real_distribution<double> uniform_dist;
     std::vector<uint64_t> key_frequencies;  // Track key access frequency
 
-    // B+tree state (local cache of tree structure)
+    // B+tree state
     uint64_t root_address;
     uint32_t tree_height;                        // Current height of the tree
     uint64_t next_node_id;                       // Counter for allocating node IDs
-    std::map<uint64_t, BTreeNode> cached_nodes;  // Simple cache
     std::map<uint64_t, uint64_t> parent_map;     // Maps child_address → parent_address (for split operations)
 
-    // RDMA interfaces (multiple for connecting to different memory servers)
-    SST::Interfaces::StandardMem* rdma_interface;  // Primary interface
-    std::vector<SST::Interfaces::StandardMem*> rdma_interfaces;  // interfaces
+    // Network interfaces (multiple for connecting to different memory servers)
+    SST::Interfaces::StandardMem* memory_interface;  // Primary interface
+    std::vector<SST::Interfaces::StandardMem*> memory_interfaces;  // Additional interfaces
+    
+    // Async operation tracking - state machine
+    std::map<SST::Interfaces::StandardMem::Request::id_t, AsyncOperation> pending_ops;
     
     // Statistics
     Statistic<uint64_t>* stat_inserts;
     Statistic<uint64_t>* stat_searches;
     Statistic<uint64_t>* stat_deletes;
-    Statistic<uint64_t>* stat_rdma_reads;
-    Statistic<uint64_t>* stat_rdma_writes;
+    Statistic<uint64_t>* stat_network_reads;
+    Statistic<uint64_t>* stat_network_writes;
     Statistic<uint64_t>* stat_total_latency;
     Statistic<uint64_t>* stat_ops_completed;
 
@@ -184,27 +198,26 @@ private:
     SST::Clock::HandlerBase* clock_handler;
     SimTime_t last_op_time;
     
-    // Outstanding operations tracking
-    std::map<uint64_t, SimTime_t> outstanding_reads;
-    std::map<uint64_t, SimTime_t> outstanding_writes;
-    
     // Helper functions
-    uint64_t hash_key_to_memory_server(uint64_t key);
     uint64_t allocate_node_address(uint64_t node_id, uint32_t level);
-    uint64_t get_lock_offset();  // Lock is at offset 0 within the node
-    SST::Interfaces::StandardMem* get_rdma_interface_for_address(uint64_t address);
+    SST::Interfaces::StandardMem* get_interface_for_address(uint64_t address);
     void process_btree_operation(const WorkloadOp& op);
     
     // B+tree structure management
     void initialize_btree();
     uint64_t calculate_tree_height(uint64_t num_keys);
     uint64_t get_child_index_for_key(const BTreeNode& node, uint64_t key);
-    BTreeNode traverse_to_leaf(uint64_t key);  // Returns leaf node (with data) for key
-    BTreeNode parse_node_from_buffer(uint64_t address, uint64_t buffer_address);  // Deserialize node from RDMA buffer
-    void split_leaf(BTreeNode& old_leaf, uint64_t new_key, uint64_t new_value);  // Handle leaf split
-    void insert_into_parent(uint64_t old_node_addr, uint64_t separator_key, uint64_t new_node_addr, uint32_t level);  // Update parent after split
-    void split_internal(BTreeNode& old_internal, uint64_t new_key, uint64_t new_child_addr, uint32_t level);  // Handle internal node split
-    uint64_t find_parent_address(uint64_t child_address, uint32_t child_level);  // Find parent of a node
+    
+    // Async operation handlers
+    void handle_read_response(SST::Interfaces::StandardMem::Request::id_t req_id, 
+                             const std::vector<uint8_t>& data);
+    void handle_write_response(SST::Interfaces::StandardMem::Request::id_t req_id);
+    void handle_leaf_operation(AsyncOperation& op, BTreeNode& leaf);
+    
+    // Data serialization/deserialization
+    BTreeNode deserialize_node(const std::vector<uint8_t>& data);
+    std::vector<uint8_t> serialize_node(const BTreeNode& node);
+    void write_node_back(const BTreeNode& node);
     
     // Debug output
     Output dbg;
