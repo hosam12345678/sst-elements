@@ -63,13 +63,13 @@ public:
         {"verbose", "Verbose debug output", "0"}
     )
 
-    SST_ELI_DOCUMENT_PORTS(
-        {"rdma_nic", "RDMA NIC connection - single interface per memory server instance", {}}
+    SST_ELI_DOCUMENT_SUBCOMPONENT_SLOTS(
+        {"mem_interface", "Memory interface - single interface per memory server instance", "SST::Interfaces::StandardMem"}
     )
 
     SST_ELI_DOCUMENT_STATISTICS(
-        {"rdma_reads_received", "Number of RDMA read requests received", "requests", 1},
-        {"rdma_writes_received", "Number of RDMA write requests received", "requests", 1},
+        {"network_reads_received", "Number of remote read requests received", "requests", 1},
+        {"network_writes_received", "Number of remote write requests received", "requests", 1},
         {"memory_reads", "Number of local memory reads", "reads", 1},
         {"memory_writes", "Number of local memory writes", "writes", 1},
         {"lock_acquisitions", "Number of lock acquisition requests", "locks", 1},
@@ -93,10 +93,10 @@ public:
     void handleMemoryEvent(SST::Interfaces::StandardMem::Request* req);
     void handleMemoryEventFromInterface(SST::Interfaces::StandardMem::Request* req, int interface_id);
 
-    // RDMA request handlers
-    void handle_rdma_read(SST::Interfaces::StandardMem::Read* req, int interface_id);
-    void handle_rdma_write(SST::Interfaces::StandardMem::Write* req, int interface_id);
-    void handle_rdma_request(SST::Interfaces::StandardMem::Request* req);
+    // Remote memory request handlers
+    void handle_remote_read(SST::Interfaces::StandardMem::Read* req, int interface_id);
+    void handle_remote_write(SST::Interfaces::StandardMem::Write* req, int interface_id);
+    void handle_remote_request(SST::Interfaces::StandardMem::Request* req);
 
     // Memory operations
     std::vector<uint8_t> read_memory(uint64_t address, size_t size);
@@ -130,15 +130,15 @@ private:
     // Lock management
     std::unordered_map<uint64_t, NodeLock> node_locks;
     
-    // RDMA interfaces (multiple for accepting connections from different compute servers)
-    SST::Interfaces::StandardMem* rdma_interface;  // Primary interface
-    std::vector<SST::Interfaces::StandardMem*> rdma_interfaces;  // Additional interfaces
-    std::vector<SST::Interfaces::StandardMem*> all_rdma_interfaces;  // All interfaces for easy lookup
+    // Memory interfaces (multiple for accepting connections from different compute servers)
+    SST::Interfaces::StandardMem* mem_interface;  // Primary interface
+    std::vector<SST::Interfaces::StandardMem*> mem_interfaces;  // Additional interfaces
+    std::vector<SST::Interfaces::StandardMem*> all_mem_interfaces;  // All interfaces for easy lookup
     std::unordered_map<SST::Interfaces::StandardMem*, int> interface_to_id;  // Map interface pointer to ID
 
     // Statistics
-    Statistic<uint64_t>* stat_rdma_reads;
-    Statistic<uint64_t>* stat_rdma_writes;
+    Statistic<uint64_t>* stat_network_reads;
+    Statistic<uint64_t>* stat_network_writes;
     Statistic<uint64_t>* stat_memory_reads;
     Statistic<uint64_t>* stat_memory_writes;
     Statistic<uint64_t>* stat_lock_acquisitions;

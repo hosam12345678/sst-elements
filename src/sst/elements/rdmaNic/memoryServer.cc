@@ -38,8 +38,8 @@ MemoryServer::MemoryServer(ComponentId_t id, Params& params) :
     out.init("MemoryServer[@p:@l]: ", 1, 0, Output::STDOUT);
 
     // Initialize statistics
-    stat_rdma_reads = registerStatistic<uint64_t>("rdma_reads_received");
-    stat_rdma_writes = registerStatistic<uint64_t>("rdma_writes_received");
+    stat_network_reads = registerStatistic<uint64_t>("network_reads_received");
+    stat_network_writes = registerStatistic<uint64_t>("network_writes_received");
     stat_memory_reads = registerStatistic<uint64_t>("memory_reads");
     stat_memory_writes = registerStatistic<uint64_t>("memory_writes");
     stat_lock_acquisitions = registerStatistic<uint64_t>("lock_acquisitions");
@@ -49,53 +49,59 @@ MemoryServer::MemoryServer(ComponentId_t id, Params& params) :
     stat_bytes_written = registerStatistic<uint64_t>("bytes_written");
     stat_memory_utilization = registerStatistic<uint64_t>("memory_utilization");
 
-    // Setup multiple RDMA interfaces 
+    // Setup multiple memory interfaces 
     // Support both architectures:
-    // 1. Multi-interface: rdma_nic_0, rdma_nic_1, ... (shared handler)
-    // 2. Single-interface: rdma_nic (dedicated handler per instance)
+    // 1. Multi-interface: mem_interface_0, mem_interface_1, ... (shared handler)
+    // 2. Single-interface: mem_interface (dedicated handler per instance)
     
     // Check if we're using single-interface architecture (dedicated instances)
     auto single_handler = new SST::Interfaces::StandardMem::Handler2<MemoryServer,&MemoryServer::handleMemoryEvent>(this);
-    auto single_interface = loadUserSubComponent<SST::Interfaces::StandardMem>("rdma_nic", SST::ComponentInfo::SHARE_NONE,
+    auto single_interface = loadUserSubComponent<SST::Interfaces::StandardMem>("mem_interface", SST::ComponentInfo::SHARE_NONE,
                                                                                registerTimeBase("1ns"), single_handler);
     if (single_interface) {
         // Single interface architecture - dedicated memory server instance
         out.output("Using single-interface architecture (dedicated instance)\n");
-        rdma_interface = single_interface;
-        all_rdma_interfaces.push_back(rdma_interface);
-        interface_to_id[rdma_interface] = 0;  // Single interface uses ID 0
-        out.output("  Loaded single RDMA interface: rdma_nic\n");
+        mem_interface = single_interface;
+        all_mem_interfaces.push_back(mem_interface);
+        interface_to_id[mem_interface] = 0;  // Single interface uses ID 0
+        
+        // CRITICAL: Tell the interface what address range this memory server handles
+        // This allows MemLink to build proper routing tables during init()
+        mem_interface->setMemoryMappedAddressRegion(base_address, memory_capacity);
+        out.output("  Loaded single memory interface: mem_interface\n");
+        out.output("  Configured address region: 0x%lx - 0x%lx (%lu GB)\n", 
+                   base_address, base_address + memory_capacity - 1, memory_capacity / (1024*1024*1024));
     } else {
         // Multi-interface architecture - shared handler
         out.output("Using multi-interface architecture (shared handler)\n");
         auto shared_handler = new SST::Interfaces::StandardMem::Handler2<MemoryServer,&MemoryServer::handleMemoryEvent>(this);
         
-        // Load RDMA interfaces for ALL compute servers (many-to-many connectivity)
+        // Load memory interfaces for ALL compute servers (many-to-many connectivity)
         for (int i = 0; i < num_compute_nodes; i++) {
-            std::string interface_name = "rdma_nic_" + std::to_string(i);
+            std::string interface_name = "mem_interface_" + std::to_string(i);
             
-            auto rdma_interface_i = loadUserSubComponent<SST::Interfaces::StandardMem>(interface_name, SST::ComponentInfo::SHARE_NONE,
+            auto mem_interface_i = loadUserSubComponent<SST::Interfaces::StandardMem>(interface_name, SST::ComponentInfo::SHARE_NONE,
                                                                                        registerTimeBase("1ns"), shared_handler);
-            if (rdma_interface_i) {
+            if (mem_interface_i) {
                 if (i == 0) {
-                    rdma_interface = rdma_interface_i;  // Store first interface as primary
+                    mem_interface = mem_interface_i;  // Store first interface as primary
                 } else {
-                    rdma_interfaces.push_back(rdma_interface_i);
+                    mem_interfaces.push_back(mem_interface_i);
                 }
-                all_rdma_interfaces.push_back(rdma_interface_i);  // Store all interfaces for lookup
-                interface_to_id[rdma_interface_i] = i;  // Map interface pointer to ID
-                out.output("  Loaded RDMA interface from Compute Server %d: %s\n", i, interface_name.c_str());
+                all_mem_interfaces.push_back(mem_interface_i);  // Store all interfaces for lookup
+                interface_to_id[mem_interface_i] = i;  // Map interface pointer to ID
+                out.output("  Loaded memory interface from Compute Server %d: %s\n", i, interface_name.c_str());
             } else {
-                out.fatal(CALL_INFO, -1, "Failed to load RDMA interface %s\n", interface_name.c_str());
+                out.fatal(CALL_INFO, -1, "Failed to load memory interface %s\n", interface_name.c_str());
             }
         }
         
-        if (all_rdma_interfaces.empty()) {
-            out.fatal(CALL_INFO, -1, "No RDMA interfaces found! Check interface configuration.\n");
+        if (all_mem_interfaces.empty()) {
+            out.fatal(CALL_INFO, -1, "No memory interfaces found! Check interface configuration.\n");
         }
     }
     
-    out.output("  Many-to-Many RDMA connectivity: %d interfaces loaded\n", (int)rdma_interfaces.size() + 1);
+    out.output("  Many-to-Many connectivity: %d interfaces loaded\n", (int)mem_interfaces.size() + 1);
     out.output("  Can accept connections from ALL compute servers\n");
 
     out.output("Memory Server %d initialized\n", memory_server_id);
@@ -108,10 +114,10 @@ MemoryServer::~MemoryServer() {
 }
 
 void MemoryServer::init(unsigned int phase) {
-    rdma_interface->init(phase);
+    mem_interface->init(phase);
     
     // Initialize all additional interfaces
-    for (auto& interface : rdma_interfaces) {
+    for (auto& interface : mem_interfaces) {
         interface->init(phase);
     }
     
@@ -135,26 +141,26 @@ void MemoryServer::init(unsigned int phase) {
 }
 
 void MemoryServer::setup() {
-    rdma_interface->setup();
+    mem_interface->setup();
     
     // Setup all additional interfaces
-    for (auto& interface : rdma_interfaces) {
+    for (auto& interface : mem_interfaces) {
         interface->setup();
     }
 }
 
 void MemoryServer::finish() {
-    rdma_interface->finish();
+    mem_interface->finish();
     
     // Finish all additional interfaces
-    for (auto& interface : rdma_interfaces) {
+    for (auto& interface : mem_interfaces) {
         interface->finish();
     }
     
     // Output final statistics
     out.output("Memory Server %d completed:\n", memory_server_id);
-    out.output("  RDMA reads: %lu, RDMA writes: %lu\n", 
-               stat_rdma_reads->getCollectionCount(), stat_rdma_writes->getCollectionCount());
+    out.output("  Remote reads: %lu, Remote writes: %lu\n", 
+               stat_network_reads->getCollectionCount(), stat_network_writes->getCollectionCount());
     out.output("  Memory utilization: %lu / %lu bytes (%.2f%%)\n", 
                memory_used, memory_capacity, (double)memory_used / memory_capacity * 100.0);
 }
@@ -171,11 +177,11 @@ void MemoryServer::handleMemoryEvent(SST::Interfaces::StandardMem::Request* req)
     // For now, default to interface 0 (will work for single interface, fail for multi)
     int interface_id = 0;
     
-    // Handle incoming RDMA requests
+    // Handle incoming remote memory requests
     if (auto read_req = dynamic_cast<SST::Interfaces::StandardMem::Read*>(req)) {
-        handle_rdma_read(read_req, interface_id);
+        handle_remote_read(read_req, interface_id);
     } else if (auto write_req = dynamic_cast<SST::Interfaces::StandardMem::Write*>(req)) {
-        handle_rdma_write(write_req, interface_id);
+        handle_remote_write(write_req, interface_id);
     }
 }
 
@@ -183,36 +189,36 @@ void MemoryServer::handleMemoryEventFromInterface(SST::Interfaces::StandardMem::
     dbg.debug(CALL_INFO, 2, 0, "Received memory event from interface %d: %s (ID=%lu)\n", 
               interface_id, req->getString().c_str(), req->getID());
     
-    // Handle incoming RDMA requests with interface ID for proper response routing
+    // Handle incoming remote memory requests with interface ID for proper response routing
     if (auto read_req = dynamic_cast<SST::Interfaces::StandardMem::Read*>(req)) {
-        handle_rdma_read(read_req, interface_id);
+        handle_remote_read(read_req, interface_id);
     } else if (auto write_req = dynamic_cast<SST::Interfaces::StandardMem::Write*>(req)) {
-        handle_rdma_write(write_req, interface_id);
+        handle_remote_write(write_req, interface_id);
     }
 }
 
-void MemoryServer::handle_rdma_read(SST::Interfaces::StandardMem::Read* req, int interface_id) {
+void MemoryServer::handle_remote_read(SST::Interfaces::StandardMem::Read* req, int interface_id) {
     // Assert to verify function is called
-    assert(req != nullptr && "handle_rdma_read called with valid request");
+    assert(req != nullptr && "handle_remote_read called with valid request");
     
     uint64_t address = req->pAddr;
     size_t size = req->size;
     
     // Assert valid address and size
-    assert(address != 0 && "RDMA read request has valid address");
-    assert(size > 0 && "RDMA read request has valid size");
+    assert(address != 0 && "Remote read request has valid address");
+    assert(size > 0 && "Remote read request has valid size");
     
-    dbg.debug(CALL_INFO, 2, 0, "RDMA READ: addr=0x%lx, size=%zu from interface %d\n", address, size, interface_id);
+    dbg.debug(CALL_INFO, 2, 0, "REMOTE READ: addr=0x%lx, size=%zu from interface %d\n", address, size, interface_id);
     
     // Always print address information showing many-to-many connectivity
-    out.output("🔍 Memory %d ← Any Compute: RDMA READ from address 0x%lx (size=%zu bytes) [Many-to-Many]\n", 
+    out.output("🔍 Memory %d ← Any Compute: REMOTE READ from address 0x%lx (size=%zu bytes) [Many-to-Many]\n", 
                memory_server_id, address, size);
     
-    stat_rdma_reads->addData(1);
+    stat_network_reads->addData(1);
     stat_bytes_read->addData(size);
     
     if (!is_address_in_range(address)) {
-        out.output("WARNING: Memory Server %d - RDMA read to invalid address 0x%lx (range: 0x%lx-0x%lx)\n", 
+        out.output("WARNING: Memory Server %d - Remote read to invalid address 0x%lx (range: 0x%lx-0x%lx)\n", 
                    memory_server_id, address, base_address, base_address + 0x1000000);
         send_response(req, false, interface_id);
         return;
@@ -227,12 +233,12 @@ void MemoryServer::handle_rdma_read(SST::Interfaces::StandardMem::Read* req, int
     
     // Get the correct interface for response based on interface_id
     SST::Interfaces::StandardMem* response_interface = nullptr;
-    if (interface_id >= 0 && interface_id < (int)all_rdma_interfaces.size()) {
-        response_interface = all_rdma_interfaces[interface_id];
+    if (interface_id >= 0 && interface_id < (int)all_mem_interfaces.size()) {
+        response_interface = all_mem_interfaces[interface_id];
         dbg.debug(CALL_INFO, 2, 0, "Sending ReadResp for request ID %lu through interface %d\n", 
                   req->getID(), interface_id);
     } else {
-        response_interface = rdma_interface;  // Fallback to primary interface
+        response_interface = mem_interface;  // Fallback to primary interface
         dbg.debug(CALL_INFO, 1, 0, "WARNING: Invalid interface_id %d, using primary interface\n", interface_id);
     }
     
@@ -240,28 +246,28 @@ void MemoryServer::handle_rdma_read(SST::Interfaces::StandardMem::Read* req, int
     response_interface->send(resp);
 }
 
-void MemoryServer::handle_rdma_write(SST::Interfaces::StandardMem::Write* req, int interface_id) {
+void MemoryServer::handle_remote_write(SST::Interfaces::StandardMem::Write* req, int interface_id) {
     // Assert to verify function is called
-    assert(req != nullptr && "handle_rdma_write called with valid request");
+    assert(req != nullptr && "handle_remote_write called with valid request");
     
     uint64_t address = req->pAddr;
     const std::vector<uint8_t>& data = req->data;
     
     // Assert valid address and data
-    assert(address != 0 && "RDMA write request has valid address");
-    assert(!data.empty() && "RDMA write request has valid data");
+    assert(address != 0 && "Remote write request has valid address");
+    assert(!data.empty() && "Remote write request has valid data");
     
-    dbg.debug(CALL_INFO, 2, 0, "RDMA WRITE: addr=0x%lx, size=%zu\n", address, data.size());
+    dbg.debug(CALL_INFO, 2, 0, "REMOTE WRITE: addr=0x%lx, size=%zu\n", address, data.size());
     
     // Always print address information showing many-to-many connectivity
-    out.output("🔍 Memory %d ← Any Compute: RDMA WRITE to address 0x%lx (size=%zu bytes) [Many-to-Many]\n", 
+    out.output("🔍 Memory %d ← Any Compute: REMOTE WRITE to address 0x%lx (size=%zu bytes) [Many-to-Many]\n", 
                memory_server_id, address, data.size());
     
-    stat_rdma_writes->addData(1);
+    stat_network_writes->addData(1);
     stat_bytes_written->addData(data.size());
     
     if (!is_address_in_range(address)) {
-        out.output("WARNING: Memory Server %d - RDMA write to invalid address 0x%lx (range: 0x%lx-0x%lx)\n", 
+        out.output("WARNING: Memory Server %d - Remote write to invalid address 0x%lx (range: 0x%lx-0x%lx)\n", 
                    memory_server_id, address, base_address, base_address + 0x1000000);
         send_response(req, false);
         return;
@@ -287,7 +293,7 @@ void MemoryServer::handle_rdma_write(SST::Interfaces::StandardMem::Write* req, i
     auto resp = new SST::Interfaces::StandardMem::WriteResp(req);
     
     // Send response with simulated latency  
-    rdma_interface->send(resp);
+    mem_interface->send(resp);
 }
 
 std::vector<uint8_t> MemoryServer::read_memory(uint64_t address, size_t size) {

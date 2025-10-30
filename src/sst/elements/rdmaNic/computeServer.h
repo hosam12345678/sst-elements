@@ -41,24 +41,7 @@ struct WorkloadOp {
     uint64_t node_id;  // Which compute node issued this
 };
 
-// Async operation tracking - state machine for multi-step operations
-struct AsyncOperation {
-    enum Type { TRAVERSAL, INSERT, SEARCH, DELETE };
-    
-    Type type;                          // What operation is this?
-    uint64_t key;                       // Key being operated on
-    uint64_t value;                     // Value (for inserts)
-    uint32_t current_level;             // Which tree level we're at
-    uint64_t current_address;           // Current node address
-    std::vector<BTreeNode> path;        // Nodes visited so far (for splits)
-    SimTime_t start_time;               // When operation started
-    
-    // Constructor
-    AsyncOperation() : type(TRAVERSAL), key(0), value(0), current_level(0), 
-                      current_address(0), start_time(0) {}
-};
-
-// B+tree node structure (dynamic fanout)
+// B+tree node structure (dynamic fanout) - MUST be defined before AsyncOperation
 struct BTreeNode {
     std::vector<uint64_t> keys;        // Keys (size = fanout)
     std::vector<uint64_t> values;      // Values for leaf nodes (size = fanout)
@@ -83,6 +66,33 @@ struct BTreeNode {
     // Data offset: sizeof(lock)
 };
 
+// Async operation tracking - state machine for multi-step operations
+struct AsyncOperation {
+    enum Type { TRAVERSAL, INSERT, SEARCH, DELETE, SPLIT_LEAF, SPLIT_INTERNAL, UPDATE_PARENT };
+    enum SplitPhase { NONE, WRITE_OLD_NODE, WRITE_NEW_NODE, READ_PARENT, UPDATE_PARENT_NODE };
+    
+    Type type;                          // What operation is this?
+    uint64_t key;                       // Key being operated on
+    uint64_t value;                     // Value (for inserts)
+    uint32_t current_level;             // Which tree level we're at
+    uint64_t current_address;           // Current node address
+    std::vector<BTreeNode> path;        // Nodes visited so far (for splits)
+    SimTime_t start_time;               // When operation started
+    
+    // Split operation state
+    SplitPhase split_phase;             // Which phase of split we're in
+    BTreeNode old_node;                 // Node being split
+    BTreeNode new_node;                 // New node created from split
+    uint64_t separator_key;             // Key to insert into parent
+    uint64_t parent_address;            // Address of parent node
+    bool is_root_split;                 // Is this splitting the root?
+    
+    // Constructor
+    AsyncOperation() : type(TRAVERSAL), key(0), value(0), current_level(0), 
+                      current_address(0), start_time(0), split_phase(NONE),
+                      separator_key(0), parent_address(0), is_root_split(false) {}
+};
+
 class ComputeServer : public SST::Component {
 public:
     SST_ELI_REGISTER_COMPONENT(
@@ -90,7 +100,7 @@ public:
         "rdmaNic",
         "computeServer",
         SST_ELI_ELEMENT_VERSION(1,0,0),
-        "Disaggregated memory compute server - generates B+tree workloads using RDMA",
+        "Disaggregated memory compute server - generates B+tree workloads",
         COMPONENT_CATEGORY_PROCESSOR
     )
 
@@ -107,22 +117,23 @@ public:
         {"verbose", "Verbose debug output", "0"}
     )
 
-    SST_ELI_DOCUMENT_PORTS(
-        {"rdma_nic_0", "RDMA NIC connection to memory server 0 (dedicated instance)", {}},
-        {"rdma_nic_1", "RDMA NIC connection to memory server 1 (dedicated instance)", {}},
-        {"rdma_nic_2", "RDMA NIC connection to memory server 2 (dedicated instance)", {}},
-        {"rdma_nic_3", "RDMA NIC connection to memory server 3 (dedicated instance)", {}},
-        {"rdma_nic_4", "RDMA NIC connection to memory server 4 (dedicated instance)", {}},
-        {"rdma_nic_5", "RDMA NIC connection to memory server 5 (dedicated instance)", {}},
-        {"rdma_nic_6", "RDMA NIC connection to memory server 6 (dedicated instance)", {}},
-        {"rdma_nic_7", "RDMA NIC connection to memory server 7 (dedicated instance)", {}}
+    SST_ELI_DOCUMENT_SUBCOMPONENT_SLOTS(
+        {"mem_interface_0", "Memory interface to memory server 0", "SST::Interfaces::StandardMem"},
+        {"mem_interface_1", "Memory interface to memory server 1", "SST::Interfaces::StandardMem"},
+        {"mem_interface_2", "Memory interface to memory server 2", "SST::Interfaces::StandardMem"},
+        {"mem_interface_3", "Memory interface to memory server 3", "SST::Interfaces::StandardMem"},
+        {"mem_interface_4", "Memory interface to memory server 4", "SST::Interfaces::StandardMem"},
+        {"mem_interface_5", "Memory interface to memory server 5", "SST::Interfaces::StandardMem"},
+        {"mem_interface_6", "Memory interface to memory server 6", "SST::Interfaces::StandardMem"},
+        {"mem_interface_7", "Memory interface to memory server 7", "SST::Interfaces::StandardMem"}
     )
+    
     SST_ELI_DOCUMENT_STATISTICS(
         {"btree_inserts", "Number of B+tree insert operations", "operations", 1},
         {"btree_searches", "Number of B+tree search operations", "operations", 1},
         {"btree_deletes", "Number of B+tree delete operations", "operations", 1},
-        {"rdma_reads", "Number of RDMA read operations", "operations", 1},
-        {"rdma_writes", "Number of RDMA write operations", "operations", 1},
+        {"network_reads", "Number of remote memory read operations", "operations", 1},
+        {"network_writes", "Number of remote memory write operations", "operations", 1},
         {"total_latency", "Total operation latency", "ns", 1},
         {"operations_completed", "Total operations completed", "operations", 1}
     )
@@ -214,10 +225,18 @@ private:
     void handle_write_response(SST::Interfaces::StandardMem::Request::id_t req_id);
     void handle_leaf_operation(AsyncOperation& op, BTreeNode& leaf);
     
+    // Async split operations
+    void split_leaf_async(AsyncOperation& op, BTreeNode& leaf, uint64_t new_key, uint64_t new_value);
+    void split_internal_async(AsyncOperation& op, BTreeNode& internal, uint64_t new_key, uint64_t new_child);
+    void handle_split_response(AsyncOperation& op);
+    void update_parent_async(uint64_t old_node_addr, uint64_t separator_key, uint64_t new_node_addr, uint32_t level);
+    
     // Data serialization/deserialization
     BTreeNode deserialize_node(const std::vector<uint8_t>& data);
     std::vector<uint8_t> serialize_node(const BTreeNode& node);
+    size_t get_serialized_node_size() const;
     void write_node_back(const BTreeNode& node);
+    void write_node_back_with_callback(const BTreeNode& node, AsyncOperation& op);
     
     // Debug output
     Output dbg;
