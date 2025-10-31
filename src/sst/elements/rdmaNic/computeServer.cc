@@ -185,7 +185,6 @@ ComputeServer::ComputeServer(ComponentId_t id, Params& params) :
     // Initialize statistics
     stat_inserts = registerStatistic<uint64_t>("btree_inserts");
     stat_searches = registerStatistic<uint64_t>("btree_searches");
-    stat_deletes = registerStatistic<uint64_t>("btree_deletes");
     stat_network_reads = registerStatistic<uint64_t>("network_reads");
     stat_network_writes = registerStatistic<uint64_t>("network_writes");
     stat_total_latency = registerStatistic<uint64_t>("total_latency");
@@ -321,8 +320,7 @@ bool ComputeServer::tick(SST::Cycle_t cycle) {
         
         // Time to process this operation
         dbg.debug(CALL_INFO, 1, 0, "Processing %s operation for key %lu at time %lu\n",
-                 (op.op_type == BTREE_INSERT) ? "INSERT" : 
-                 (op.op_type == BTREE_SEARCH) ? "SEARCH" : "DELETE", op.key, current_time);
+                 (op.op_type == BTREE_INSERT) ? "INSERT" : "SEARCH", op.key, current_time);
         
         process_btree_operation(op);
         pending_operations.pop();
@@ -382,12 +380,8 @@ WorkloadOp ComputeServer::generate_next_operation() {
     if (rand_val < read_ratio) {
         op.op_type = BTREE_SEARCH;
     } else {
-        // Split writes between inserts and deletes (90% insert, 10% delete)
-        if (uniform_dist(rng) < 0.9) {
-            op.op_type = BTREE_INSERT;
-        } else {
-            op.op_type = BTREE_DELETE;
-        }
+        // All writes are inserts
+        op.op_type = BTREE_INSERT;
     }
     
     // Generate key using Zipfian distribution
@@ -435,9 +429,6 @@ void ComputeServer::process_btree_operation(const WorkloadOp& op) {
             break;
         case BTREE_SEARCH:
             btree_search_async(op.key);
-            break;
-        case BTREE_DELETE:
-            btree_delete_async(op.key);
             break;
     }
     // Note: stat_ops_completed will be updated when operation completes asynchronously
@@ -495,34 +486,6 @@ void ComputeServer::btree_search_async(uint64_t key) {
     
     out.output("   Started async traversal from root=0x%lx\n", root_address);
 }
-
-void ComputeServer::btree_delete_async(uint64_t key) {
-    dbg.debug(CALL_INFO, 2, 0, "B+tree DELETE (async): key=%lu\n", key);
-    out.output("\n🗑️  DELETE Operation (async): key=%lu\n", key);
-    
-    // Create read request for root node
-    auto req = new SST::Interfaces::StandardMem::Read(root_address, get_serialized_node_size());
-    auto req_id = req->getID();
-    
-    // Track this async operation
-    pending_ops[req_id] = AsyncOperation();
-    pending_ops[req_id].type = AsyncOperation::DELETE;
-    pending_ops[req_id].key = key;
-    pending_ops[req_id].current_level = 0;
-    pending_ops[req_id].current_address = root_address;
-    pending_ops[req_id].start_time = getCurrentSimTime();
-    
-    // Send read request
-    SST::Interfaces::StandardMem* target_interface = get_interface_for_address(root_address);
-    target_interface->send(req);
-    stat_network_reads->addData(1);
-    
-    out.output("   Started async traversal from root=0x%lx\n", root_address);
-}
-
-
-
-
 
 void ComputeServer::initialize_btree() {
     // Calculate optimal tree height based on key range and fanout
@@ -673,9 +636,46 @@ void ComputeServer::handle_read_response(SST::Interfaces::StandardMem::Request::
     
     // Special case: READ_PARENT phase of split operation
     if (op.split_phase == AsyncOperation::READ_PARENT) {
-        out.output("   ✓ Phase 3: Parent node read complete\n");
-        
         BTreeNode parent = deserialize_node(data);
+        
+        // Check if we're still traversing to find the parent (when parent_address was 0)
+        if (op.parent_address == 0 && !parent.is_leaf) {
+            // Still traversing internal nodes to find the parent of the split node
+            // Use the separator key to find which child to follow
+            uint64_t child_idx = 0;
+            while (child_idx < parent.num_keys && parent.keys[child_idx] < op.separator_key) {
+                child_idx++;
+            }
+            
+            uint64_t child_addr = parent.children[child_idx];
+            
+            // Check if this child is one of our split nodes
+            if (child_addr == op.old_node.node_address || child_addr == op.new_node.node_address) {
+                // Found the parent!
+                out.output("   ✓ Phase 3: Found parent at 0x%lx during traversal\n", parent.node_address);
+                op.parent_address = parent.node_address;
+                // Continue with inserting separator key (fall through to insertion logic below)
+            } else {
+                // Continue traversing down
+                out.output("   → Traversing to child[%lu] = 0x%lx to find parent\n", child_idx, child_addr);
+                
+                op.current_level++;
+                op.current_address = child_addr;
+                
+                auto next_req = new SST::Interfaces::StandardMem::Read(child_addr, get_serialized_node_size());
+                auto next_req_id = next_req->getID();
+                pending_ops[next_req_id] = op;
+                
+                SST::Interfaces::StandardMem* target_interface = get_interface_for_address(child_addr);
+                target_interface->send(next_req);
+                stat_network_reads->addData(1);
+                
+                pending_ops.erase(req_id);
+                return;
+            }
+        } else {
+            out.output("   ✓ Phase 3: Parent node read complete\n");
+        }
         
         // Check if parent has space for separator key
         if (parent.num_keys < btree_fanout) {
@@ -865,39 +865,6 @@ void ComputeServer::handle_leaf_operation(AsyncOperation& op, BTreeNode& leaf) {
             break;
         }
             
-        case AsyncOperation::DELETE: {
-            out.output("   Executing DELETE in leaf: key=%lu\n", op.key);
-            stat_deletes->addData(1);
-            
-            // Find and remove key
-            bool found_del = false;
-            uint32_t del_pos = 0;
-            for (uint32_t i = 0; i < leaf.num_keys; i++) {
-                if (leaf.keys[i] == op.key) {
-                    found_del = true;
-                    del_pos = i;
-                    break;
-                }
-            }
-            
-            if (found_del) {
-                // Shift keys to fill gap
-                for (uint32_t i = del_pos; i < leaf.num_keys - 1; i++) {
-                    leaf.keys[i] = leaf.keys[i+1];
-                    leaf.values[i] = leaf.values[i+1];
-                }
-                leaf.num_keys--;
-                out.output("   ✓ Deleted key=%lu from position %u (now %u keys)\n",
-                           op.key, del_pos, leaf.num_keys);
-                
-                // Write back modified leaf
-                write_node_back(leaf);
-            } else {
-                out.output("   ✗ Key=%lu NOT FOUND (nothing to delete)\n", op.key);
-            }
-            break;
-        }
-            
         default:
             break;
     }
@@ -989,13 +956,14 @@ void ComputeServer::split_leaf_async(AsyncOperation& op, BTreeNode& old_leaf, ui
         out.output("   → Moving old root to new address 0x%lx\n", old_leaf_new_address);
     } else {
         op.is_root_split = false;
-        // Find parent from parent_map
-        if (parent_map.count(old_leaf.node_address)) {
-            op.parent_address = parent_map[old_leaf.node_address];
-            out.output("   Parent address: 0x%lx (from parent_map)\n", op.parent_address);
+        // Parent is the second-to-last node in the traversal path
+        if (op.path.size() >= 2) {
+            BTreeNode parent = op.path[op.path.size() - 2];
+            op.parent_address = parent.node_address;
+            out.output("   Parent address: 0x%lx (from traversal path)\n", op.parent_address);
         } else {
-            out.output("   WARNING: Parent not in map, will need to find it\n");
-            op.parent_address = 0;  // Will need to find it
+            out.output("   ERROR: Path too short (%zu nodes), cannot find parent\n", op.path.size());
+            op.parent_address = 0;
         }
     }
     
@@ -1087,23 +1055,34 @@ void ComputeServer::split_internal_async(AsyncOperation& op, BTreeNode& old_inte
     // Save split state
     op.type = AsyncOperation::SPLIT_INTERNAL;
     op.split_phase = AsyncOperation::WRITE_OLD_NODE;
-    op.old_node = old_internal;
-    op.new_node = new_internal;
     op.separator_key = promoted_key;
     
     // Check if splitting root
     if (old_internal.node_address == root_address) {
         op.is_root_split = true;
         out.output("   ⚠️  Splitting ROOT node - will create new root\n");
+        
+        // When splitting root, allocate NEW address for old internal (root address will be reused for new root)
+        uint64_t old_internal_new_id = next_node_id++;
+        uint64_t old_internal_new_address = allocate_node_address(old_internal_new_id, op.current_level);
+        old_internal.node_address = old_internal_new_address;  // Update old internal to use new address
+        out.output("   → Moving old root to new address 0x%lx\n", old_internal_new_address);
     } else {
         op.is_root_split = false;
-        if (parent_map.count(old_internal.node_address)) {
-            op.parent_address = parent_map[old_internal.node_address];
-            out.output("   Parent address: 0x%lx (from parent_map)\n", op.parent_address);
+        // Parent is the second-to-last node in the traversal path
+        if (op.path.size() >= 2) {
+            BTreeNode parent = op.path[op.path.size() - 2];
+            op.parent_address = parent.node_address;
+            out.output("   Parent address: 0x%lx (from traversal path)\n", op.parent_address);
         } else {
+            out.output("   ERROR: Path too short (%zu nodes), cannot find parent\n", op.path.size());
             op.parent_address = 0;
         }
     }
+    
+    // Save nodes to operation AFTER potentially updating old_internal address
+    op.old_node = old_internal;
+    op.new_node = new_internal;
     
     // Start async write sequence
     auto req = new SST::Interfaces::StandardMem::Write(
@@ -1184,18 +1163,40 @@ void ComputeServer::handle_split_response(AsyncOperation& op) {
                 
             } else {
                 // Non-root split - need to update parent
-                out.output("   → Phase 3: Reading parent 0x%lx to insert separator key=%lu\n",
-                           op.parent_address, op.separator_key);
                 
-                op.split_phase = AsyncOperation::READ_PARENT;
-                
-                auto req = new SST::Interfaces::StandardMem::Read(op.parent_address, get_serialized_node_size());
-                auto req_id = req->getID();
-                pending_ops[req_id] = op;
-                
-                SST::Interfaces::StandardMem* target_interface = get_interface_for_address(op.parent_address);
-                target_interface->send(req);
-                stat_network_reads->addData(1);
+                // Check if we have valid parent address
+                if (op.parent_address == 0) {
+                    // Parent not in map - need to traverse from root to find it
+                    out.output("   → Phase 3: Parent unknown, traversing from root 0x%lx to find parent\n", 
+                               root_address);
+                    
+                    op.split_phase = AsyncOperation::READ_PARENT;
+                    op.current_address = root_address;
+                    op.current_level = 0;
+                    
+                    // Start traversal from root using separator key
+                    auto req = new SST::Interfaces::StandardMem::Read(root_address, get_serialized_node_size());
+                    auto req_id = req->getID();
+                    pending_ops[req_id] = op;
+                    
+                    SST::Interfaces::StandardMem* target_interface = get_interface_for_address(root_address);
+                    target_interface->send(req);
+                    stat_network_reads->addData(1);
+                } else {
+                    // Have parent address, read it directly
+                    out.output("   → Phase 3: Reading parent 0x%lx to insert separator key=%lu\n",
+                               op.parent_address, op.separator_key);
+                    
+                    op.split_phase = AsyncOperation::READ_PARENT;
+                    
+                    auto req = new SST::Interfaces::StandardMem::Read(op.parent_address, get_serialized_node_size());
+                    auto req_id = req->getID();
+                    pending_ops[req_id] = op;
+                    
+                    SST::Interfaces::StandardMem* target_interface = get_interface_for_address(op.parent_address);
+                    target_interface->send(req);
+                    stat_network_reads->addData(1);
+                }
             }
             break;
             

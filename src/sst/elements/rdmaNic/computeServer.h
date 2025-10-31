@@ -28,8 +28,7 @@ namespace MemHierarchy {
 // B+tree operation types
 enum BTreeOp {
     BTREE_INSERT,
-    BTREE_SEARCH, 
-    BTREE_DELETE
+    BTREE_SEARCH
 };
 
 // Workload operation structure
@@ -68,7 +67,7 @@ struct BTreeNode {
 
 // Async operation tracking - state machine for multi-step operations
 struct AsyncOperation {
-    enum Type { TRAVERSAL, INSERT, SEARCH, DELETE, SPLIT_LEAF, SPLIT_INTERNAL, UPDATE_PARENT };
+    enum Type { TRAVERSAL, INSERT, SEARCH, SPLIT_LEAF, SPLIT_INTERNAL, UPDATE_PARENT };
     enum SplitPhase { NONE, WRITE_OLD_NODE, WRITE_NEW_NODE, READ_PARENT, UPDATE_PARENT_NODE };
     
     Type type;                          // What operation is this?
@@ -131,7 +130,6 @@ public:
     SST_ELI_DOCUMENT_STATISTICS(
         {"btree_inserts", "Number of B+tree insert operations", "operations", 1},
         {"btree_searches", "Number of B+tree search operations", "operations", 1},
-        {"btree_deletes", "Number of B+tree delete operations", "operations", 1},
         {"network_reads", "Number of remote memory read operations", "operations", 1},
         {"network_writes", "Number of remote memory write operations", "operations", 1},
         {"total_latency", "Total operation latency", "ns", 1},
@@ -157,7 +155,6 @@ public:
     // These initiate async B+tree operations
     void btree_insert_async(uint64_t key, uint64_t value);
     void btree_search_async(uint64_t key);
-    void btree_delete_async(uint64_t key);
 
     // Workload generation
     void generate_workload();
@@ -199,7 +196,6 @@ private:
     // Statistics
     Statistic<uint64_t>* stat_inserts;
     Statistic<uint64_t>* stat_searches;
-    Statistic<uint64_t>* stat_deletes;
     Statistic<uint64_t>* stat_network_reads;
     Statistic<uint64_t>* stat_network_writes;
     Statistic<uint64_t>* stat_total_latency;
