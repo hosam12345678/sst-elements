@@ -26,8 +26,6 @@ MemoryServer::MemoryServer(ComponentId_t id, Params& params) :
     memory_capacity = params.find<uint64_t>("memory_capacity_gb", 16) * 1024 * 1024 * 1024; // Convert to bytes
     memory_latency = params.find<SimTime_t>("memory_latency_ns", 100);
     btree_node_size = params.find<size_t>("btree_node_size", 4096);
-    enable_locking = params.find<bool>("enable_locking", true);
-    lock_timeout = params.find<SimTime_t>("lock_timeout_us", 10000) * 1000; // Convert to ns
     verbose_level = params.find<int>("verbose", 0);
 
     // Calculate base address for this memory server - each server gets 16MB address space
@@ -42,63 +40,50 @@ MemoryServer::MemoryServer(ComponentId_t id, Params& params) :
     stat_network_writes = registerStatistic<uint64_t>("network_writes_received");
     stat_memory_reads = registerStatistic<uint64_t>("memory_reads");
     stat_memory_writes = registerStatistic<uint64_t>("memory_writes");
-    stat_lock_acquisitions = registerStatistic<uint64_t>("lock_acquisitions");
-    stat_lock_releases = registerStatistic<uint64_t>("lock_releases");
-    stat_lock_conflicts = registerStatistic<uint64_t>("lock_conflicts");
     stat_bytes_read = registerStatistic<uint64_t>("bytes_read");
     stat_bytes_written = registerStatistic<uint64_t>("bytes_written");
     stat_memory_utilization = registerStatistic<uint64_t>("memory_utilization");
-
-    // Setup multiple memory interfaces 
-    // Support both architectures:
-    // 1. Multi-interface: mem_interface_0, mem_interface_1, ... (shared handler)
-    // 2. Single-interface: mem_interface (dedicated handler per instance)
     
-    // Check if we're using single-interface architecture (dedicated instances)
-    auto single_handler = new SST::Interfaces::StandardMem::Handler2<MemoryServer,&MemoryServer::handleMemoryEvent>(this);
-    auto single_interface = loadUserSubComponent<SST::Interfaces::StandardMem>("mem_interface", SST::ComponentInfo::SHARE_NONE,
-                                                                               registerTimeBase("1ns"), single_handler);
-    if (single_interface) {
-        // Single interface architecture - dedicated memory server instance
-        out.output("Using single-interface architecture (dedicated instance)\n");
-        mem_interface = single_interface;
-        all_mem_interfaces.push_back(mem_interface);
-        interface_to_id[mem_interface] = 0;  // Single interface uses ID 0
+    // Lock statistics
+    stat_locks_acquired = registerStatistic<uint64_t>("locks_acquired");
+    stat_locks_released = registerStatistic<uint64_t>("locks_released");
+    stat_lock_conflicts = registerStatistic<uint64_t>("lock_conflicts");
+    stat_lock_wait_time = registerStatistic<uint64_t>("lock_wait_time");
+    
+    // Initialize lock counters
+    total_locks_acquired = 0;
+    total_locks_released = 0;
+    total_lock_conflicts = 0;
+
+    // Setup multiple memory interfaces for many-to-many connectivity
+    // Create SEPARATE handler for EACH interface so we know which interface to respond through
+    out.output("Loading memory interfaces (N interfaces, N handlers approach)...\n");
+    
+    for (int i = 0; i < num_compute_nodes; i++) {
+        std::string interface_name = "mem_interface_" + std::to_string(i);
         
-        // CRITICAL: Tell the interface what address range this memory server handles
-        // This allows MemLink to build proper routing tables during init()
-        mem_interface->setMemoryMappedAddressRegion(base_address, memory_capacity);
-        out.output("  Loaded single memory interface: mem_interface\n");
-        out.output("  Configured address region: 0x%lx - 0x%lx (%lu GB)\n", 
-                   base_address, base_address + memory_capacity - 1, memory_capacity / (1024*1024*1024));
-    } else {
-        // Multi-interface architecture - shared handler
-        out.output("Using multi-interface architecture (shared handler)\n");
-        auto shared_handler = new SST::Interfaces::StandardMem::Handler2<MemoryServer,&MemoryServer::handleMemoryEvent>(this);
+        // Create handler with data parameter for interface ID
+        auto handler_for_interface_i = new SST::Interfaces::StandardMem::Handler2<MemoryServer, &MemoryServer::handleMemoryEventFromInterface, int>(this, i);
         
-        // Load memory interfaces for ALL compute servers (many-to-many connectivity)
-        for (int i = 0; i < num_compute_nodes; i++) {
-            std::string interface_name = "mem_interface_" + std::to_string(i);
-            
-            auto mem_interface_i = loadUserSubComponent<SST::Interfaces::StandardMem>(interface_name, SST::ComponentInfo::SHARE_NONE,
-                                                                                       registerTimeBase("1ns"), shared_handler);
-            if (mem_interface_i) {
-                if (i == 0) {
-                    mem_interface = mem_interface_i;  // Store first interface as primary
-                } else {
-                    mem_interfaces.push_back(mem_interface_i);
-                }
-                all_mem_interfaces.push_back(mem_interface_i);  // Store all interfaces for lookup
-                interface_to_id[mem_interface_i] = i;  // Map interface pointer to ID
-                out.output("  Loaded memory interface from Compute Server %d: %s\n", i, interface_name.c_str());
+        auto mem_interface_i = loadUserSubComponent<SST::Interfaces::StandardMem>(interface_name, SST::ComponentInfo::SHARE_NONE,
+                                                                                   registerTimeBase("1ns"), handler_for_interface_i);
+        if (mem_interface_i) {
+            if (i == 0) {
+                mem_interface = mem_interface_i;  // Store first interface as primary
             } else {
-                out.fatal(CALL_INFO, -1, "Failed to load memory interface %s\n", interface_name.c_str());
+                mem_interfaces.push_back(mem_interface_i);
             }
+            all_mem_interfaces.push_back(mem_interface_i);  // Store all interfaces for lookup
+            interface_to_id[mem_interface_i] = i;  // Map interface pointer to ID
+            out.output("  Loaded memory interface from Compute Server %d: %s\n", i, interface_name.c_str());
+        } else {
+            // Interface not configured - this is OK, not all compute servers need to connect
+            out.output("  Interface %s not configured (optional)\n", interface_name.c_str());
         }
-        
-        if (all_mem_interfaces.empty()) {
-            out.fatal(CALL_INFO, -1, "No memory interfaces found! Check interface configuration.\n");
-        }
+    }
+    
+    if (all_mem_interfaces.empty()) {
+        out.fatal(CALL_INFO, -1, "No memory interfaces found! At least one interface must be configured.\n");
     }
     
     out.output("  Many-to-Many connectivity: %d interfaces loaded\n", (int)mem_interfaces.size() + 1);
@@ -169,20 +154,9 @@ void MemoryServer::handleMemoryEvent(SST::Interfaces::StandardMem::Request* req)
     dbg.debug(CALL_INFO, 2, 0, "Received memory event: %s (ID=%lu)\n", 
               req->getString().c_str(), req->getID());
     
-    // We need to determine which interface this request came from
-    // Unfortunately, the StandardMem handler doesn't provide this directly
-    // For now, we'll use a heuristic or store interface information differently
-    
-    // TODO: This is a limitation - we can't easily determine the source interface
-    // For now, default to interface 0 (will work for single interface, fail for multi)
-    int interface_id = 0;
-    
-    // Handle incoming remote memory requests
-    if (auto read_req = dynamic_cast<SST::Interfaces::StandardMem::Read*>(req)) {
-        handle_remote_read(read_req, interface_id);
-    } else if (auto write_req = dynamic_cast<SST::Interfaces::StandardMem::Write*>(req)) {
-        handle_remote_write(write_req, interface_id);
-    }
+    // Call handleMemoryEventFromInterface with interface_id = 0
+    // This works because responses are broadcast to all interfaces anyway
+    handleMemoryEventFromInterface(req, 0);
 }
 
 void MemoryServer::handleMemoryEventFromInterface(SST::Interfaces::StandardMem::Request* req, int interface_id) {
@@ -273,27 +247,25 @@ void MemoryServer::handle_remote_write(SST::Interfaces::StandardMem::Write* req,
         return;
     }
     
-    // Check if this is a lock operation
-    if (enable_locking && is_lock_address(address)) {
-        // Handle lock operation
-        uint64_t lock_value = *reinterpret_cast<const uint64_t*>(data.data());
-        uint64_t requester_id = (lock_value == 0) ? 0 : lock_value; // 0 = release, non-zero = acquire
-        
-        if (lock_value == 0) {
-            release_lock(address, requester_id);
-        } else {
-            acquire_lock(address, requester_id);
-        }
-    } else {
-        // Regular memory write
-        write_memory(address, data);
-    }
+    // Regular memory write
+    write_memory(address, data);
     
-    // Send write response
+    // Send write response through the CORRECT interface
     auto resp = new SST::Interfaces::StandardMem::WriteResp(req);
     
-    // Send response with simulated latency  
-    mem_interface->send(resp);
+    // Get the correct interface for response based on interface_id
+    SST::Interfaces::StandardMem* response_interface = nullptr;
+    if (interface_id >= 0 && interface_id < (int)all_mem_interfaces.size()) {
+        response_interface = all_mem_interfaces[interface_id];
+        dbg.debug(CALL_INFO, 2, 0, "Sending WriteResp for request ID %lu through interface %d\n", 
+                  req->getID(), interface_id);
+    } else {
+        response_interface = mem_interface;  // Fallback to primary interface
+        dbg.debug(CALL_INFO, 1, 0, "WARNING: Invalid interface_id %d, using primary interface\n", interface_id);
+    }
+    
+    // Send response through the correct interface
+    response_interface->send(resp);
 }
 
 std::vector<uint8_t> MemoryServer::read_memory(uint64_t address, size_t size) {
@@ -333,80 +305,12 @@ void MemoryServer::write_memory(uint64_t address, const std::vector<uint8_t>& da
         new_block.data = data;
         new_block.last_access = getCurrentSimTime();
         new_block.access_count = 1;
-        new_block.is_locked = false;
-        new_block.lock_owner = 0;
         
         memory_blocks[address] = new_block;
         memory_used += data.size();
     }
     
     update_memory_stats();
-}
-
-bool MemoryServer::acquire_lock(uint64_t lock_address, uint64_t requester_id) {
-    dbg.debug(CALL_INFO, 3, 0, "Lock acquire: addr=0x%lx, requester=%lu\n", lock_address, requester_id);
-    
-    stat_lock_acquisitions->addData(1);
-    
-    auto it = node_locks.find(lock_address);
-    if (it == node_locks.end()) {
-        // Create new lock
-        NodeLock new_lock;
-        new_lock.lock_address = lock_address;
-        new_lock.is_locked = true;
-        new_lock.owner_id = requester_id;
-        new_lock.lock_time = getCurrentSimTime();
-        
-        node_locks[lock_address] = new_lock;
-        return true;
-    } else {
-        // Lock exists, check if available
-        NodeLock& lock = it->second;
-        if (!lock.is_locked) {
-            // Lock is available
-            lock.is_locked = true;
-            lock.owner_id = requester_id;
-            lock.lock_time = getCurrentSimTime();
-            return true;
-        } else {
-            // Lock is held by someone else
-            stat_lock_conflicts->addData(1);
-            lock.waiting_queue.push(requester_id);
-            return false;
-        }
-    }
-}
-
-void MemoryServer::release_lock(uint64_t lock_address, uint64_t requester_id) {
-    dbg.debug(CALL_INFO, 3, 0, "Lock release: addr=0x%lx, requester=%lu\n", lock_address, requester_id);
-    
-    stat_lock_releases->addData(1);
-    
-    auto it = node_locks.find(lock_address);
-    if (it != node_locks.end()) {
-        NodeLock& lock = it->second;
-        if (lock.is_locked && lock.owner_id == requester_id) {
-            // Release the lock
-            lock.is_locked = false;
-            lock.owner_id = 0;
-            
-            // Check if anyone is waiting
-            if (!lock.waiting_queue.empty()) {
-                uint64_t next_owner = lock.waiting_queue.front();
-                lock.waiting_queue.pop();
-                
-                // Grant lock to next waiter
-                lock.is_locked = true;
-                lock.owner_id = next_owner;
-                lock.lock_time = getCurrentSimTime();
-            }
-        }
-    }
-}
-
-bool MemoryServer::is_lock_address(uint64_t address) {
-    // Lock addresses are at a fixed offset from node addresses
-    return (address >= base_address + 0x100000) && (address < base_address + 0x200000);
 }
 
 void MemoryServer::store_btree_node(uint64_t address, const std::vector<uint8_t>& node_data) {
@@ -440,23 +344,246 @@ void MemoryServer::update_memory_stats() {
     }
 }
 
-void MemoryServer::cleanup_expired_locks() {
-    SimTime_t current_time = getCurrentSimTime();
-    
-    for (auto& pair : node_locks) {
-        NodeLock& lock = pair.second;
-        if (lock.is_locked && (current_time - lock.lock_time) > lock_timeout) {
-            // Lock has expired, release it
-            out.output("WARNING: Lock 0x%lx expired for owner %lu\n", 
-                       lock.lock_address, lock.owner_id);
-            lock.is_locked = false;
-            lock.owner_id = 0;
-        }
-    }
-}
-
 void MemoryServer::send_response(SST::Interfaces::StandardMem::Request* req, bool success, int interface_id) {
     // Send error response through the correct interface if needed
     // For now, we'll just delete the request
     delete req;
+}
+
+// ===== SHARED/EXCLUSIVE LOCK IMPLEMENTATIONS =====
+
+bool MemoryServer::try_acquire_shared_lock(uint64_t node_address) {
+    if (!is_address_in_range(node_address)) {
+        out.output("ERROR: try_acquire_shared_lock on invalid address 0x%lx\n", node_address);
+        return false;
+    }
+    
+    // Read current lock state (first 8 bytes of node)
+    std::vector<uint8_t> lock_data = read_memory(node_address, LOCK_HEADER_SIZE);
+    uint64_t current_state;
+    memcpy(&current_state, lock_data.data(), sizeof(uint64_t));
+    
+    NodeLock lock;
+    lock.state = current_state;
+    
+    if (lock.is_unlocked()) {
+        // Unlocked → transition to shared with count=1
+        uint64_t new_state = 1;
+        std::vector<uint8_t> new_lock_data(LOCK_HEADER_SIZE);
+        memcpy(new_lock_data.data(), &new_state, sizeof(uint64_t));
+        write_memory(node_address, new_lock_data);
+        
+        total_locks_acquired++;
+        stat_locks_acquired->addData(1);
+        
+        if (verbose_level >= 3) {
+            out.output("🔓→🔒 Memory %d: Acquired SHARED lock on node 0x%lx (count=1)\n", 
+                       memory_server_id, node_address);
+        }
+        return true;
+        
+    } else if (lock.is_shared()) {
+        // Already shared → increment reader count
+        uint64_t new_state = current_state + 1;
+        std::vector<uint8_t> new_lock_data(LOCK_HEADER_SIZE);
+        memcpy(new_lock_data.data(), &new_state, sizeof(uint64_t));
+        write_memory(node_address, new_lock_data);
+        
+        total_locks_acquired++;
+        stat_locks_acquired->addData(1);
+        
+        if (verbose_level >= 3) {
+            out.output("🔒+ Memory %d: Acquired SHARED lock on node 0x%lx (count=%lu)\n", 
+                       memory_server_id, node_address, new_state);
+        }
+        return true;
+        
+    } else {
+        // Exclusive lock held - cannot acquire shared
+        total_lock_conflicts++;
+        stat_lock_conflicts->addData(1);
+        
+        if (verbose_level >= 3) {
+            uint64_t owner = lock.get_owner();
+            out.output("❌ Memory %d: DENIED SHARED lock on node 0x%lx (exclusive by compute %lu)\n", 
+                       memory_server_id, node_address, owner);
+        }
+        return false;
+    }
+}
+
+bool MemoryServer::release_shared_lock(uint64_t node_address) {
+    if (!is_address_in_range(node_address)) {
+        out.output("ERROR: release_shared_lock on invalid address 0x%lx\n", node_address);
+        return false;
+    }
+    
+    // Read current lock state
+    std::vector<uint8_t> lock_data = read_memory(node_address, LOCK_HEADER_SIZE);
+    uint64_t current_state;
+    memcpy(&current_state, lock_data.data(), sizeof(uint64_t));
+    
+    NodeLock lock;
+    lock.state = current_state;
+    
+    if (!lock.is_shared()) {
+        out.output("ERROR: Trying to release shared lock on node 0x%lx but it's not shared (state=0x%lx)\n", 
+                   node_address, current_state);
+        return false;
+    }
+    
+    // Decrement reader count
+    uint64_t new_state;
+    if (current_state == 1) {
+        // Last reader - unlock completely
+        new_state = 0;
+        if (verbose_level >= 3) {
+            out.output("🔒→🔓 Memory %d: Released SHARED lock on node 0x%lx (unlocked)\n", 
+                       memory_server_id, node_address);
+        }
+    } else {
+        // Still other readers
+        new_state = current_state - 1;
+        if (verbose_level >= 3) {
+            out.output("🔒- Memory %d: Released SHARED lock on node 0x%lx (count=%lu)\n", 
+                       memory_server_id, node_address, new_state);
+        }
+    }
+    
+    std::vector<uint8_t> new_lock_data(LOCK_HEADER_SIZE);
+    memcpy(new_lock_data.data(), &new_state, sizeof(uint64_t));
+    write_memory(node_address, new_lock_data);
+    
+    total_locks_released++;
+    stat_locks_released->addData(1);
+    
+    return true;
+}
+
+bool MemoryServer::try_acquire_exclusive_lock(uint64_t node_address, uint64_t compute_id) {
+    if (!is_address_in_range(node_address)) {
+        out.output("ERROR: try_acquire_exclusive_lock on invalid address 0x%lx\n", node_address);
+        return false;
+    }
+    
+    // Read current lock state
+    std::vector<uint8_t> lock_data = read_memory(node_address, LOCK_HEADER_SIZE);
+    uint64_t current_state;
+    memcpy(&current_state, lock_data.data(), sizeof(uint64_t));
+    
+    NodeLock lock;
+    lock.state = current_state;
+    
+    if (lock.is_unlocked()) {
+        // Unlocked → acquire exclusive
+        uint64_t new_state = NodeLock::make_exclusive(compute_id);
+        std::vector<uint8_t> new_lock_data(LOCK_HEADER_SIZE);
+        memcpy(new_lock_data.data(), &new_state, sizeof(uint64_t));
+        write_memory(node_address, new_lock_data);
+        
+        // Verify we got it (check for race)
+        std::vector<uint8_t> verify_data = read_memory(node_address, LOCK_HEADER_SIZE);
+        uint64_t verify_state;
+        memcpy(&verify_state, verify_data.data(), sizeof(uint64_t));
+        
+        if (verify_state == new_state) {
+            total_locks_acquired++;
+            stat_locks_acquired->addData(1);
+            
+            if (verbose_level >= 3) {
+                out.output("🔓→🔐 Memory %d: Acquired EXCLUSIVE lock on node 0x%lx by compute %lu\n", 
+                           memory_server_id, node_address, compute_id);
+            }
+            return true;
+        } else {
+            // Race condition - someone else got it
+            total_lock_conflicts++;
+            stat_lock_conflicts->addData(1);
+            
+            if (verbose_level >= 3) {
+                out.output("❌ Memory %d: RACE on EXCLUSIVE lock for node 0x%lx (lost to another compute)\n", 
+                           memory_server_id, node_address);
+            }
+            return false;
+        }
+    } else {
+        // Already locked (shared or exclusive)
+        total_lock_conflicts++;
+        stat_lock_conflicts->addData(1);
+        
+        if (verbose_level >= 3) {
+            if (lock.is_shared()) {
+                out.output("❌ Memory %d: DENIED EXCLUSIVE lock on node 0x%lx (shared by %lu readers)\n", 
+                           memory_server_id, node_address, lock.get_reader_count());
+            } else {
+                out.output("❌ Memory %d: DENIED EXCLUSIVE lock on node 0x%lx (exclusive by compute %lu)\n", 
+                           memory_server_id, node_address, lock.get_owner());
+            }
+        }
+        return false;
+    }
+}
+
+bool MemoryServer::release_exclusive_lock(uint64_t node_address, uint64_t compute_id) {
+    if (!is_address_in_range(node_address)) {
+        out.output("ERROR: release_exclusive_lock on invalid address 0x%lx\n", node_address);
+        return false;
+    }
+    
+    // Read current lock state
+    std::vector<uint8_t> lock_data = read_memory(node_address, LOCK_HEADER_SIZE);
+    uint64_t current_state;
+    memcpy(&current_state, lock_data.data(), sizeof(uint64_t));
+    
+    NodeLock lock;
+    lock.state = current_state;
+    
+    // Verify we own it
+    if (!lock.is_exclusive() || lock.get_owner() != compute_id) {
+        out.output("ERROR: Compute %lu trying to release exclusive lock on node 0x%lx but doesn't own it (state=0x%lx)\n", 
+                   compute_id, node_address, current_state);
+        return false;
+    }
+    
+    // Release (write 0)
+    uint64_t new_state = 0;
+    std::vector<uint8_t> new_lock_data(LOCK_HEADER_SIZE);
+    memcpy(new_lock_data.data(), &new_state, sizeof(uint64_t));
+    write_memory(node_address, new_lock_data);
+    
+    total_locks_released++;
+    stat_locks_released->addData(1);
+    
+    if (verbose_level >= 3) {
+        out.output("🔐→🔓 Memory %d: Released EXCLUSIVE lock on node 0x%lx by compute %lu\n", 
+                   memory_server_id, node_address, compute_id);
+    }
+    
+    return true;
+}
+
+// Lock state queries
+uint64_t MemoryServer::read_lock_state(uint64_t node_address) {
+    if (!is_address_in_range(node_address)) {
+        return 0;
+    }
+    
+    std::vector<uint8_t> lock_data = read_memory(node_address, LOCK_HEADER_SIZE);
+    uint64_t state;
+    memcpy(&state, lock_data.data(), sizeof(uint64_t));
+    return state;
+}
+
+bool MemoryServer::is_locked_shared(uint64_t node_address) {
+    uint64_t state = read_lock_state(node_address);
+    NodeLock lock;
+    lock.state = state;
+    return lock.is_shared();
+}
+
+bool MemoryServer::is_locked_exclusive(uint64_t node_address) {
+    uint64_t state = read_lock_state(node_address);
+    NodeLock lock;
+    lock.state = state;
+    return lock.is_exclusive();
 }

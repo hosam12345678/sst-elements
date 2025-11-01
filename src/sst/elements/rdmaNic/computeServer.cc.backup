@@ -1,0 +1,1178 @@
+// Copyright 2009-2025 NTESS. Under the terms
+// of Contract DE-NA0003525 with NTESS, the U.S.
+// Government retains certain rights in this software.
+//
+// Copyright (c) 2009-2025, NTESS
+// All rights reserved.
+//
+// This file is part of the SST software package. For license
+// information, see the LICENSE file in the top-level directory of the
+// distribution.
+//
+// Disaggregated Memory Compute Server Implementation
+// Implements B+tree operations using remote memory access
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// MEMORY LAYOUT ARCHITECTURE
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// This system implements a disaggregated memory architecture where:
+// - COMPUTE SERVERS: Run application logic, issue memory operations
+// - MEMORY SERVERS: Store data, respond to read/write requests
+//
+// ┌─────────────────────────────────────────────────────────────────────────┐
+// │                    REMOTE MEMORY ADDRESS SPACE                          │
+// │                    (Disaggregated Memory Servers)                       │
+// └─────────────────────────────────────────────────────────────────────────┘
+//
+// Each Memory Server has 16 MB of address space:
+//
+//   Memory Server 0: 0x10000000 - 0x10FFFFFF  (16 MB)
+//   Memory Server 1: 0x11000000 - 0x11FFFFFF  (16 MB)
+//   Memory Server 2: 0x12000000 - 0x12FFFFFF  (16 MB)
+//   Memory Server 3: 0x13000000 - 0x13FFFFFF  (16 MB)
+//   ...
+//   Memory Server N: 0x10000000 + N*0x1000000 to 0x10000000 + (N+1)*0x1000000
+//
+// Within EACH Memory Server's 16MB space, B+tree nodes are organized by level:
+//
+//   ┌──────────────────────────────────────────────────────────────┐
+//   │ Address Range        │ Tree Level      │ Size      │ Usage   │
+//   ├──────────────────────────────────────────────────────────────┤
+//   │ 0x00000 - 0x0FFFF   │ Root (Level 0)   │ 64 KB     │ Root    │
+//   │ 0x10000 - 0x1FFFF   │ Level 1          │ 64 KB     │ Internal│
+//   │ 0x20000 - 0x3FFFF   │ Level 2          │ 128 KB    │ Internal│
+//   │ 0x40000 - 0x1FFFFF  │ Level 3+         │ 1.75 MB   │ Internal│
+//   │ 0x200000 - 0xFFFFFF │ Leaves           │ 14 MB     │ Leaf    │
+//   └──────────────────────────────────────────────────────────────┘
+//
+// Example: Root node on Memory Server 0 = 0x10000000
+//          Leaf node on Memory Server 2 = 0x12200000 + offset
+//
+// ┌─────────────────────────────────────────────────────────────────────────┐
+// │                    COMPUTE-TO-MEMORY INTERACTION                        │
+// └─────────────────────────────────────────────────────────────────────────┘
+//
+// Compute Server operates on B+tree stored across memory servers:
+//
+// 1. REMOTE READ Operation:
+//    - Compute server sends Read request to target memory server
+//    - Memory server responds with serialized node data
+//    - Compute server deserializes data directly from network response
+//    
+//    Example: Read root node from Memory Server 0
+//      Request:  StandardMem::Read(addr=0x10000000, size=node_size)
+//      Response: StandardMem::ReadResp with serialized BTreeNode data
+//      Action:   deserialize_node(response.data) → BTreeNode object
+//
+// 2. REMOTE WRITE Operation:
+//    - Compute server serializes node to bytes
+//    - Sends Write request with serialized data to target memory server
+//    - Memory server stores data and sends acknowledgment
+//    
+//    Example: Write leaf node to Memory Server 2
+//      Data:     serialize_node(leaf) → std::vector<uint8_t>
+//      Request:  StandardMem::Write(addr=0x12300000, size=node_size, data)
+//      Response: StandardMem::WriteResp (acknowledgment)
+//
+// 3. Tree Traversal Example (search for key=12345):
+//    Step 1: Read root from Memory Server 0 (addr=0x10000000)
+//    Step 2: Deserialize root, find child pointer
+//    Step 3: Read internal node from Memory Server 1 (addr=0x11010000)
+//    Step 4: Deserialize internal, find child pointer
+//    Step 5: Read leaf from Memory Server 3 (addr=0x13250000)
+//    Step 6: Deserialize leaf, search for key=12345
+//
+// ═══════════════════════════════════════════════════════════════════════════
+
+#include <sst_config.h>
+#include "computeServer.h"
+#include <sst/core/interfaces/stdMem.h>
+#include <cstdio>
+#include <cassert>
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MEMORY ADDRESS CONSTANTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Remote Memory Server Address Space
+const uint64_t MEMORY_BASE_ADDRESS = 0x10000000;   // Base address for all memory servers
+const uint64_t MEMORY_SERVER_SIZE  = 0x1000000;    // 16 MB per memory server
+// Memory Server N range: [MEMORY_BASE_ADDRESS + N*MEMORY_SERVER_SIZE, 
+//                         MEMORY_BASE_ADDRESS + (N+1)*MEMORY_SERVER_SIZE)
+
+// Per-Server B+tree Level Offsets (relative to server's base)
+const uint64_t BTREE_LEVEL0_OFFSET = 0x00000;      // Root level: 0-64KB
+const uint64_t BTREE_LEVEL1_OFFSET = 0x10000;      // Level 1: 64KB-128KB
+const uint64_t BTREE_LEVEL2_OFFSET = 0x20000;      // Level 2: 128KB-256KB
+const uint64_t BTREE_LEVEL3_OFFSET = 0x40000;      // Level 3+: 256KB-2MB
+const uint64_t BTREE_LEAF_OFFSET   = 0x200000;     // Leaves: 2MB-16MB
+
+// Helper macros
+#define GET_MEMORY_SERVER(addr) (((addr) - MEMORY_BASE_ADDRESS) / MEMORY_SERVER_SIZE)
+
+using namespace SST;
+using namespace SST::MemHierarchy;
+
+ComputeServer::ComputeServer(ComponentId_t id, Params& params) :
+    SST::Component(id),
+    rng(std::random_device{}() + id),  // Add component ID to ensure different seeds
+    uniform_dist(0.0, 1.0),
+    last_op_time(0)
+{
+    // Parse configuration parameters
+    node_id = params.find<uint32_t>("node_id", 0);
+    num_memory_nodes = params.find<uint32_t>("num_memory_nodes", 4);
+    workload_type = params.find<std::string>("workload_type", "ycsb_a");
+    ops_per_second = params.find<uint32_t>("operations_per_second", 10000);
+    simulation_duration = params.find<SimTime_t>("simulation_duration_us", 1000000) * 1000; // Convert to ns
+    zipfian_alpha = params.find<double>("zipfian_alpha", 0.9);
+    std::string key_dist = params.find<std::string>("key_distribution", "zipfian"); // New parameter
+    read_ratio = params.find<double>("read_ratio", 0.95);
+    btree_fanout = params.find<uint32_t>("btree_fanout", 16);
+    key_range = params.find<uint64_t>("key_range", 1000000);
+    verbose_level = params.find<int>("verbose", 0);
+
+    // Override zipfian_alpha based on distribution type
+    if (key_dist == "uniform") {
+        zipfian_alpha = 0.0;  // Force uniform distribution
+    }
+    
+    // Configure uniform integer distribution with actual key range    
+    // Initialize key frequency tracking (for first 100 keys to show distribution)
+    key_frequencies.resize(std::min(key_range, static_cast<uint64_t>(100)), 0);
+
+    // Initialize B+tree state
+    tree_height = 1;  // Start with just root (which is also a leaf)
+    next_node_id = 0;  // Start node ID counter
+    root_address = MEMORY_BASE_ADDRESS;  // Root always at memory server 0's base address
+
+    // Setup debug output with maximum verbosity for address visibility
+    dbg.init("", 5, 0, (Output::output_location_t)1);  // Force high verbosity
+    out.init("ComputeServer[@p:@l]: ", 1, 0, Output::STDOUT);
+    
+    // Initialize B+tree serializer
+    serializer = new BTreeSerializer(btree_fanout, &out);
+    
+    // Initialize B+tree lock manager
+    lock_manager = new BTreeLockManager(node_id, verbose_level, &out);
+    
+    // Initialize B+tree operations
+    btree_ops = new BTreeOperations(root_address, btree_fanout, verbose_level, &out);
+
+    // Initialize statistics
+    stat_inserts = registerStatistic<uint64_t>("btree_inserts");
+    stat_searches = registerStatistic<uint64_t>("btree_searches");
+    stat_network_reads = registerStatistic<uint64_t>("network_reads");
+    stat_network_writes = registerStatistic<uint64_t>("network_writes");
+    stat_total_latency = registerStatistic<uint64_t>("total_latency");
+    stat_ops_completed = registerStatistic<uint64_t>("operations_completed");
+
+    // Setup multiple network interfaces (one per memory server)
+    auto mem_handler = new SST::Interfaces::StandardMem::Handler2<ComputeServer,&ComputeServer::handleMemoryEvent>(this);
+    
+    // Load network interfaces for ALL memory servers (many-to-many connectivity)
+    for (int i = 0; i < num_memory_nodes; i++) {
+        std::string interface_name = "mem_interface_" + std::to_string(i);
+        auto interface_i = loadUserSubComponent<SST::Interfaces::StandardMem>(interface_name, SST::ComponentInfo::SHARE_NONE, 
+                                                                                   registerTimeBase("1ns"), mem_handler);
+        if (interface_i) {
+            if (i == 0) {
+                memory_interface = interface_i;  // Store first interface as primary
+            } else {
+                memory_interfaces.push_back(interface_i);
+            }
+            out.output("  Loaded network interface to Memory Server %d: %s\n", i, interface_name.c_str());
+        } else {
+            out.fatal(CALL_INFO, -1, "Failed to load network interface %s\n", interface_name.c_str());
+        }
+    }
+    
+    out.output("  Many-to-Many connectivity: %d interfaces loaded\n", (int)memory_interfaces.size() + 1);
+    out.output("  Can connect to ALL %d memory servers\n", num_memory_nodes);
+
+    // Set up clock at high frequency (1MHz) to avoid time faults
+    // We'll process operations based on their scheduled timestamps, not clock ticks
+    std::string clock_freq = "1MHz";  // High enough to avoid time ordering issues
+    clock_handler = new SST::Clock::Handler2<ComputeServer,&ComputeServer::tick>(this);
+    registerClock(clock_freq, clock_handler);
+
+    out.output("Compute Server %d initialized\n", node_id);
+    out.output("  Workload: %s, Ops/sec: %d, Read ratio: %.2f\n", 
+               workload_type.c_str(), ops_per_second, read_ratio);
+    out.output("  Key distribution: %s (alpha=%.2f), Key range: %lu\n", 
+               (zipfian_alpha <= 0.0) ? "UNIFORM" : "ZIPFIAN", zipfian_alpha, key_range);
+    
+    // DEBUG: Force output of parameters for debugging
+    out.output("DEBUG: key_dist='%s', zipfian_alpha=%.6f, key_range=%lu\n", 
+               key_dist.c_str(), zipfian_alpha, key_range);
+}
+
+ComputeServer::~ComputeServer() {
+    // Cleanup
+    if (serializer) {
+        delete serializer;
+        serializer = nullptr;
+    }
+    if (lock_manager) {
+        delete lock_manager;
+        lock_manager = nullptr;
+    }
+    if (btree_ops) {
+        delete btree_ops;
+        btree_ops = nullptr;
+    }
+}
+
+void ComputeServer::init(unsigned int phase) {
+    memory_interface->init(phase);
+    
+    // Initialize all additional interfaces
+    for (auto& interface : memory_interfaces) {
+        interface->init(phase);
+    }
+    
+    if (phase == 0) {
+        // Debug initialization parameters
+        out.output("DEBUG Node %d: Initializing with alpha=%.1f, key_range=%lu, distribution=%s\n", 
+                   node_id, zipfian_alpha, key_range, 
+                   (zipfian_alpha <= 0.0) ? "UNIFORM" : "ZIPFIAN");
+        
+        // Don't initialize B+tree here - wait for setup() after address exchange completes
+        
+        // Generate initial workload
+        generate_workload();
+        out.output("Generated %zu operations for workload\n", pending_operations.size());
+    }
+}
+
+void ComputeServer::setup() {
+    memory_interface->setup();
+    
+    // Setup all additional interfaces
+    for (auto& interface : memory_interfaces) {
+        interface->setup();
+    }
+    
+    // NOW initialize B+tree after init() phases complete and address routing is established
+    initialize_btree();
+}
+
+void ComputeServer::finish() {
+    memory_interface->finish();
+    
+    // Finish all additional interfaces
+    for (auto& interface : memory_interfaces) {
+        interface->finish();
+    }
+    
+    // Output final statistics
+    out.output("Compute Server %d completed:\n", node_id);
+    out.output("  Total operations: %lu\n", stat_ops_completed->getCollectionCount());
+    out.output("  Network reads: %lu, Network writes: %lu\n", 
+               stat_network_reads->getCollectionCount(), stat_network_writes->getCollectionCount());
+    
+    // Output key distribution analysis
+    out.output("\n📊 Key Distribution Analysis:\n");
+    out.output("  Distribution type: %s (alpha=%.2f)\n", 
+               (zipfian_alpha <= 0.0) ? "UNIFORM" : "ZIPFIAN", zipfian_alpha);
+    
+    uint64_t total_accesses = 0;
+    for (size_t i = 0; i < std::min(key_frequencies.size(), static_cast<size_t>(20)); i++) {
+        total_accesses += key_frequencies[i];
+    }
+    
+    for (size_t i = 0; i < std::min(key_frequencies.size(), static_cast<size_t>(20)); i++) {
+        if (key_frequencies[i] > 0) {
+            double percentage = (total_accesses > 0) ? (key_frequencies[i] * 100.0 / total_accesses) : 0.0;
+            out.output("  Key %2zu: %4lu accesses (%.1f%%)\n", i, key_frequencies[i], percentage);
+        }
+    }
+}
+
+bool ComputeServer::tick(SST::Cycle_t cycle) {
+    SimTime_t current_time = getCurrentSimTime();
+    
+    // Check if simulation should end
+    if (current_time > simulation_duration) {
+        return true;  // Stop clock
+    }
+    
+    // Process operations whose scheduled time has arrived
+    while (!pending_operations.empty()) {
+        WorkloadOp& op = pending_operations.front();
+        
+        // Check if it's time to process this operation
+        if (op.timestamp > current_time) {
+            // Not yet time for this operation
+            break;
+        }
+        
+        // Time to process this operation
+        dbg.debug(CALL_INFO, 1, 0, "Processing %s operation for key %lu at time %lu\n",
+                 (op.op_type == BTREE_INSERT) ? "INSERT" : "SEARCH", op.key, current_time);
+        
+        process_btree_operation(op);
+        pending_operations.pop();
+    }
+    
+    return false;  // Continue ticking
+}
+
+void ComputeServer::handleMemoryEvent(SST::Interfaces::StandardMem::Request* req) {
+    // Handle network memory response events
+    auto req_id = req->getID();
+    SimTime_t current_time = getCurrentSimTime();
+    
+    if (auto read_resp = dynamic_cast<SST::Interfaces::StandardMem::ReadResp*>(req)) {
+        // Handle read response with async state machine
+        dbg.debug(CALL_INFO, 3, 0, "Network READ response received, req_id=%lu\n", req_id);
+        handle_read_response(req_id, read_resp->data);
+        
+    } else if (auto write_resp = dynamic_cast<SST::Interfaces::StandardMem::WriteResp*>(req)) {
+        // Handle write response
+        dbg.debug(CALL_INFO, 3, 0, "Network WRITE response received, req_id=%lu\n", req_id);
+        handle_write_response(req_id);
+    }
+    
+    delete req;
+}
+
+void ComputeServer::generate_workload() {
+    out.output("DEBUG Node %d: Starting workload generation...\n", node_id);
+    
+    // Calculate time interval between operations
+    // SST uses nanoseconds as base time unit (SimTime_t is in nanoseconds)
+    // 1 second = 1,000,000,000 nanoseconds
+    // Example: If ops_per_second = 1000:
+    //   op_interval = 1,000,000,000 / 1000 = 1,000,000 ns = 1 ms
+    SimTime_t op_interval = 1000000000ULL / ops_per_second;  // Interval in nanoseconds
+    SimTime_t current_time = 0;  // Start at 0 nanoseconds
+    
+    // Generate operations for the simulation duration
+    while (current_time < simulation_duration) {
+        WorkloadOp op = generate_next_operation();
+        op.timestamp = current_time;  // When to execute (in nanoseconds)
+        op.node_id = node_id;
+        
+        pending_operations.push(op);
+        current_time += op_interval;  // Add nanoseconds to schedule next operation
+    }
+    
+    out.output("DEBUG Node %d: Generated %zu operations\n", node_id, pending_operations.size());
+}
+
+WorkloadOp ComputeServer::generate_next_operation() {
+    WorkloadOp op;
+    
+    // Determine operation type based on read ratio
+    double rand_val = uniform_dist(rng);
+    if (rand_val < read_ratio) {
+        op.op_type = BTREE_SEARCH;
+    } else {
+        // All writes are inserts
+        op.op_type = BTREE_INSERT;
+    }
+    
+    // Generate key using Zipfian distribution
+    op.key = get_zipfian_key();
+    op.value = op.key * 1000 + node_id;  // Simple value generation
+    
+    return op;
+}
+
+uint64_t ComputeServer::get_zipfian_key() {
+    uint64_t key;
+    double rand_val = uniform_dist(rng);
+    
+    if (zipfian_alpha <= 0.0) {
+        // UNIFORM distribution - force a range of keys for testing
+        key = static_cast<uint64_t>(rand_val * key_range);
+        
+        // Use SST output instead of printf for visibility
+        out.output("DEBUG UNIFORM: node=%d, rand_val=%.6f, key_range=%lu -> key=%lu (alpha=%.1f)\n", 
+                   node_id, rand_val, key_range, key, zipfian_alpha);
+    } else {
+        // Zipfian distribution using inverse power method
+        // Avoid rand_val = 0 to prevent pow(0, negative) = infinity
+        if (rand_val == 0.0) rand_val = 1e-10;
+        
+        key = static_cast<uint64_t>(pow(rand_val, -1.0 / zipfian_alpha)) % key_range;
+        
+        // Use SST output instead of printf for visibility
+        out.output("DEBUG ZIPFIAN: node=%d, rand_val=%.6f -> pow(%.6f, -1/%.1f) = %.2f -> key=%lu\n", 
+                   node_id, rand_val, rand_val, zipfian_alpha, pow(rand_val, -1.0 / zipfian_alpha), key);
+    }
+    
+    // Track frequency for first 100 keys to show distribution pattern
+    if (key < key_frequencies.size()) {
+        key_frequencies[key]++;
+    }
+    
+    return key;
+}
+
+void ComputeServer::process_btree_operation(const WorkloadOp& op) {
+    switch (op.op_type) {
+        case BTREE_INSERT:
+            btree_insert_async(op.key, op.value);
+            break;
+        case BTREE_SEARCH:
+            btree_search_async(op.key);
+            break;
+    }
+    // Note: stat_ops_completed will be updated when operation completes asynchronously
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ASYNC B+TREE OPERATIONS - Entry points that start async state machines
+// ═══════════════════════════════════════════════════════════════════════════
+
+void ComputeServer::btree_insert_async(uint64_t key, uint64_t value) {
+    dbg.debug(CALL_INFO, 2, 0, "B+Tree INSERT (async): key=%lu, value=%lu\n", key, value);
+    
+    // Create async operation to track this INSERT
+    AsyncOperation op;
+    op.start_time = getCurrentSimTime();
+    
+    // Delegate to BTreeOperations
+    auto interface_getter = [this](uint64_t addr) { return get_interface_for_address(addr); };
+    btree_ops->btree_insert_async(key, value, op, pending_ops, lock_manager, interface_getter, stat_network_reads);
+}
+
+void ComputeServer::btree_search_async(uint64_t key) {
+    dbg.debug(CALL_INFO, 2, 0, "B+tree SEARCH (async): key=%lu\n", key);
+    
+    // Create async operation to track this SEARCH
+    AsyncOperation op;
+    op.start_time = getCurrentSimTime();
+    
+    // Delegate to BTreeOperations
+    auto interface_getter = [this](uint64_t addr) { return get_interface_for_address(addr); };
+    btree_ops->btree_search_async(key, op, pending_ops, lock_manager, interface_getter, stat_network_reads);
+}
+
+// ===== Lock Management Functions =====
+
+// Lock management functions delegated to BTreeLockManager
+
+void ComputeServer::continue_traversal_with_lock_crabbing(SST::Interfaces::StandardMem::Request::id_t req_id,
+                                                          AsyncOperation& op, uint64_t child_addr) {
+    // Implement lock crabbing protocol: acquire child lock, then release parent lock
+    // This ensures we always hold at most 2 locks during transition
+    
+    if (verbose_level >= 2) {
+        out.output("   🔐 Lock crabbing: acquiring lock on child 0x%lx\n", child_addr);
+    }
+    
+    // Save parent address before we update current_address
+    uint64_t parent_address = op.current_address;
+    
+    // Update operation state for next level
+    pending_ops[req_id].current_level++;
+    pending_ops[req_id].current_address = child_addr;
+    
+    // Determine lock type based on operation type
+    bool need_exclusive = (op.type == AsyncOperation::INSERT);
+    
+    // Get the interface for sending requests
+    SST::Interfaces::StandardMem* interface = get_interface_for_address(child_addr);
+    
+    // Acquire lock on child (this will trigger reading the child after lock is acquired)
+    lock_manager->try_acquire_lock_async(pending_ops[req_id], child_addr, need_exclusive, interface, pending_ops);
+    stat_network_reads->addData(1);
+    
+    // Release parent lock (safe point - child lock acquisition in progress)
+    auto interface_getter = [this](uint64_t addr) { return get_interface_for_address(addr); };
+    lock_manager->release_parent_lock_during_crabbing(pending_ops[req_id], parent_address, interface_getter);
+    stat_network_writes->addData(1);
+    
+    // Clean up old request (operation continues with child lock acquisition)
+    pending_ops.erase(req_id);
+}
+
+
+
+void ComputeServer::initialize_btree() {
+    // Calculate optimal tree height based on key range and fanout
+    tree_height = calculate_tree_height(key_range);
+    
+    out.output("🌳 Initializing B+tree structure:\n");
+    out.output("   Fanout: %u keys per node\n", btree_fanout);
+    out.output("   Tree height: %u levels\n", tree_height);
+    out.output("   Key range: %lu keys\n", key_range);
+    out.output("   Estimated leaf nodes: %lu\n", (key_range + btree_fanout - 1) / btree_fanout);
+    
+    // Create root node (initially a leaf)
+    BTreeNode root(btree_fanout);
+    root.is_leaf = true;
+    root.num_keys = 0;
+    root.node_address = allocate_node_address(next_node_id++, 0);  // Root at level 0
+    
+    root_address = root.node_address;
+    
+    // Write root node to memory (NOT cached locally)
+    write_node_back(root);
+    
+    out.output("   Root address: 0x%lx (Memory Server %lu)\n", 
+               root_address, GET_MEMORY_SERVER(root_address));
+    out.output("   ✓ Root node written to remote memory\n");
+}
+
+uint64_t ComputeServer::calculate_tree_height(uint64_t num_keys) {
+    // Calculate tree height needed to store num_keys
+    // Each leaf can hold 'fanout' keys
+    // Each internal node can have 'fanout+1' children
+    
+    if (num_keys == 0) return 1;
+    
+    uint64_t leaves_needed = (num_keys + btree_fanout - 1) / btree_fanout;
+    uint32_t height = 1;  // At least the leaf level
+    
+    uint64_t nodes_at_level = leaves_needed;
+    while (nodes_at_level > 1) {
+        nodes_at_level = (nodes_at_level + btree_fanout) / (btree_fanout + 1);
+        height++;
+    }
+    
+    return height;
+}
+
+uint64_t ComputeServer::allocate_node_address(uint64_t node_id, uint32_t level) {
+    // Allocate address for a B+tree node based on:
+    // 1. Node ID (unique identifier)
+    // 2. Level in tree (0=root, tree_height-1=leaves)
+    //
+    // Memory Layout per server (16 MB):
+    // ┌────────────────────────────────────────┐
+    // │ Level 0 (Root):        0x00000 - 0x0FFFF  (64 KB)   │
+    // │ Level 1 (Internal):    0x10000 - 0x3FFFF  (192 KB)  │
+    // │ Level 2 (Internal):    0x40000 - 0x1FFFFF (1.75 MB) │
+    // │ Leaves:                0x200000 - 0xFFFFFF (14 MB)  │
+    // └────────────────────────────────────────┘
+    
+    // Determine which memory server based on node_id for load balancing
+    uint64_t memory_server = node_id % num_memory_nodes;
+    uint64_t base_address = MEMORY_BASE_ADDRESS + memory_server * MEMORY_SERVER_SIZE;
+    
+    uint64_t offset;
+    uint64_t level_base;
+    
+    if (level == 0) {
+        // Root level: First 64 KB (only 1 node ever at level 0)
+        offset = BTREE_LEVEL0_OFFSET;
+    } else if (level < tree_height - 1) {
+        // Internal nodes: Allocate in regions based on level
+        // Use the proper level-specific base addresses
+        if (level == 1) {
+            level_base = BTREE_LEVEL1_OFFSET;
+        } else if (level == 2) {
+            level_base = BTREE_LEVEL2_OFFSET;
+        } else {
+            level_base = BTREE_LEVEL3_OFFSET;
+        }
+        offset = level_base + (node_id % 10000) * get_serialized_node_size();
+    } else {
+        // Leaf nodes: Start at 2 MB offset, use most of the space
+        offset = BTREE_LEAF_OFFSET + (node_id % 100000) * get_serialized_node_size();
+    }
+    
+    uint64_t final_address = base_address + offset;
+    
+    out.output("📍 Allocated Node %lu (Level %u) → Memory Server %lu: Address 0x%lx\n",
+               node_id, level, memory_server, final_address);
+    
+    return final_address;
+}
+
+uint64_t ComputeServer::get_child_index_for_key(const BTreeNode& node, uint64_t key) {
+    // Find the child pointer index for a given key in an internal node
+    // B+tree property: keys[i] is the minimum key in child[i+1]
+    
+    if (node.num_keys == 0) {
+        return 0;  // Empty node, use first child
+    }
+    
+    // Binary search for the right child
+    for (uint32_t i = 0; i < node.num_keys; i++) {
+        if (key < node.keys[i]) {
+            return i;  // Key belongs in child[i]
+        }
+    }
+    
+    // Key is >= all keys, belongs in rightmost child
+    return node.num_keys;
+}
+
+SST::Interfaces::StandardMem* ComputeServer::get_interface_for_address(uint64_t address) {
+    // Many-to-Many: Determine which memory server this address belongs to
+    uint64_t memory_server_id = GET_MEMORY_SERVER(address);
+    
+    // Clamp to valid range - this compute server can connect to ANY memory server
+    if (memory_server_id >= num_memory_nodes) {
+        memory_server_id = 0;  // Default to primary interface
+    }
+    
+    // Debug output for interface selection
+    dbg.debug(CALL_INFO, 4, 0, "Address 0x%lx → Memory Server %lu\n", address, memory_server_id);
+    
+    // Return appropriate interface for many-to-many connectivity
+    if (memory_server_id == 0) {
+        return memory_interface;  // Primary interface for memory server 0
+    } else {
+        // Use additional interfaces for other memory servers
+        size_t interface_index = memory_server_id - 1;
+        if (interface_index < memory_interfaces.size()) {
+            return memory_interfaces[interface_index];
+        } else {
+            // Fallback to primary interface if additional interface not available
+            dbg.debug(CALL_INFO, 2, 0, "WARNING: No interface for memory server %lu, using primary\n", memory_server_id);
+            return memory_interface;
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ASYNC RESPONSE HANDLERS - State machine continuation
+// ═══════════════════════════════════════════════════════════════════════════
+
+void ComputeServer::handle_read_response(SST::Interfaces::StandardMem::Request::id_t req_id,
+                                         const std::vector<uint8_t>& data) {
+    // Check if this is one of our tracked async operations
+    if (!pending_ops.count(req_id)) {
+        dbg.debug(CALL_INFO, 2, 0, "WARNING: Received read response for unknown request\n");
+        return;
+    }
+    
+    auto& op = pending_ops[req_id];
+    
+    // Dispatch to lock response handler if this is a lock acquisition
+    if (op.waiting_for_lock) {
+        lock_manager->handle_lock_response(req_id, data, pending_ops, 
+                                          get_interface_for_address(op.lock_target_address),
+                                          get_serialized_node_size());
+        stat_network_reads->addData(1);  // For subsequent read after lock acquired
+        return;
+    }
+    
+    // Special case: UPDATE_PARENT_NODE phase during split
+    if (op.split_phase == AsyncOperation::UPDATE_PARENT_NODE) {
+        BTreeNode parent = serializer->deserialize(data);
+        out.output("   ✓ Phase 3: Parent node read (lock held), inserting separator key=%lu\n", op.separator_key);
+        
+        // Check if parent has space for separator key
+        if (parent.num_keys < btree_fanout) {
+            out.output("   Parent has space (%u/%u) - inserting separator\n",
+                       parent.num_keys, btree_fanout);
+            
+            // Find insertion position
+            uint32_t insert_pos = 0;
+            while (insert_pos < parent.num_keys && parent.keys[insert_pos] < op.separator_key) {
+                insert_pos++;
+            }
+            
+            // Shift keys and children
+            for (uint32_t i = parent.num_keys; i > insert_pos; i--) {
+                parent.keys[i] = parent.keys[i-1];
+                parent.children[i+1] = parent.children[i];
+            }
+            
+            // Insert separator key and new child
+            parent.keys[insert_pos] = op.separator_key;
+            parent.children[insert_pos + 1] = op.new_node.node_address;
+            parent.num_keys++;
+            
+            out.output("   ✓ Inserted separator at position %u (now %u keys)\n",
+                       insert_pos, parent.num_keys);
+            
+            // Write parent back - write FULL node including lock header
+            // We hold the lock, so we can safely write over it
+            // The lock will remain in memory until we explicitly release it
+            auto serialized_parent = serializer->serialize(parent);
+            
+            // Prepend 8 zero bytes for lock header (lock remains held until released)
+            constexpr size_t lock_header_size = BTreeLockManager::get_lock_header_size();
+            std::vector<uint8_t> full_node_data(lock_header_size + serialized_parent.size());
+            // Keep lock header as-is (we still hold the lock)
+            // Just write zeros to preserve lock state in memory for now
+            std::memset(full_node_data.data(), 0, lock_header_size);
+            std::memcpy(full_node_data.data() + lock_header_size, serialized_parent.data(), serialized_parent.size());
+            
+            auto req = new SST::Interfaces::StandardMem::Write(
+                parent.node_address,  // Write from start (includes lock header)
+                full_node_data.size(), 
+                full_node_data);
+            
+            SST::Interfaces::StandardMem* target_interface = get_interface_for_address(parent.node_address);
+            target_interface->send(req);
+            stat_network_writes->addData(1);
+            
+            // Release parent lock after write
+            out.output("   🔓 Releasing parent lock on 0x%lx\n", parent.node_address);
+            std::vector<uint8_t> unlock_data(lock_header_size, 0);
+            auto unlock_req = new SST::Interfaces::StandardMem::Write(parent.node_address, lock_header_size, unlock_data);
+            target_interface->send(unlock_req);
+            stat_network_writes->addData(1);
+            
+            // Remove from held locks
+            auto lock_it = std::find(op.held_locks.begin(), op.held_locks.end(), parent.node_address);
+            if (lock_it != op.held_locks.end()) {
+                op.held_locks.erase(lock_it);
+            }
+            
+            // Split complete - operation done
+            SimTime_t latency = getCurrentSimTime() - op.start_time;
+            stat_total_latency->addData(latency);
+            stat_ops_completed->addData(1);
+            
+            out.output("   ✓ Phase 3 complete: Parent updated, lock released, split done\n");
+            
+        } else {
+            // Parent is full - need to split it recursively
+            out.output("   ⚠️  Parent FULL (%u/%u) - splitting parent recursively\n",
+                       parent.num_keys, btree_fanout);
+            
+            // Release parent lock before recursively splitting
+            out.output("   🔓 Releasing parent lock before recursive split\n");
+            constexpr size_t lock_header_size = BTreeLockManager::get_lock_header_size();
+            std::vector<uint8_t> unlock_data(lock_header_size, 0);
+            auto unlock_req = new SST::Interfaces::StandardMem::Write(parent.node_address, lock_header_size, unlock_data);
+            SST::Interfaces::StandardMem* target_interface = get_interface_for_address(parent.node_address);
+            target_interface->send(unlock_req);
+            stat_network_writes->addData(1);
+            
+            // Remove from held locks
+            auto lock_it = std::find(op.held_locks.begin(), op.held_locks.end(), parent.node_address);
+            if (lock_it != op.held_locks.end()) {
+                op.held_locks.erase(lock_it);
+            }
+            
+            split_internal_async(op, parent, op.separator_key, op.new_node.node_address);
+        }
+        
+        pending_ops.erase(req_id);
+        return;
+    }
+    
+    // Regular traversal read
+    BTreeNode node = serializer->deserialize(data);
+    op.path.push_back(node);  // Save for potential splits
+    
+    out.output("   Level %u: Read node at 0x%lx, keys=%u, is_leaf=%d\n",
+               op.current_level, op.current_address, node.num_keys, node.is_leaf);
+    
+    // Check if we've reached a leaf node
+    if (node.is_leaf || op.current_level >= tree_height - 1) {
+        // Reached leaf - perform the actual operation
+        out.output("   ✓ Reached leaf at 0x%lx (Level %u) with %u keys\n",
+                   op.current_address, op.current_level, node.num_keys);
+        
+        // Delegate to BTreeOperations
+        auto interface_getter = [this](uint64_t addr) { return get_interface_for_address(addr); };
+        btree_ops->handle_leaf_operation(op, node, pending_ops, serializer, interface_getter, stat_network_writes);
+        stat_inserts->addData(op.type == AsyncOperation::INSERT ? 1 : 0);
+        stat_searches->addData(op.type == AsyncOperation::SEARCH ? 1 : 0);
+        
+        // Check if leaf is full and needs split
+        if (op.type == AsyncOperation::INSERT && node.num_keys >= btree_fanout) {
+            // Need to split - delegate to BTreeOperations
+            auto allocate_func = [this](uint64_t id, uint32_t level) { return allocate_node_address(id, level); };
+            btree_ops->split_leaf_async(op, node, op.key, op.value, pending_ops, serializer, lock_manager,
+                                       interface_getter, allocate_func, next_node_id, parent_map,
+                                       stat_network_writes, stat_network_reads);
+            // Split started - don't clean up yet, let split complete
+            pending_ops.erase(req_id);
+            return;
+        }
+        
+        // Check if operation returned early (e.g., split started)
+        if (pending_ops.count(req_id)) {
+            // Operation complete - release all locks
+            if (verbose_level >= 2) {
+                out.output("   Step 3: Operation complete, releasing locks\n");
+            }
+            lock_manager->release_all_locks(op, interface_getter);
+            stat_network_writes->addData(op.held_locks.size());  // Track lock release writes
+            
+            // Record statistics (only if not splitting)
+            SimTime_t latency = getCurrentSimTime() - op.start_time;
+            stat_total_latency->addData(latency);
+            stat_ops_completed->addData(1);
+            
+            // Clean up
+            pending_ops.erase(req_id);
+        }
+        
+    } else {
+        // Internal node - continue traversal to child with lock crabbing
+        uint64_t child_idx = get_child_index_for_key(node, op.key);
+        uint64_t child_addr = node.children[child_idx];
+        
+        out.output("   → Continue to child[%lu] = 0x%lx\n", child_idx, child_addr);
+        
+        // Record parent relationship for potential splits
+        parent_map[child_addr] = op.current_address;
+        
+        // Use helper function to handle lock crabbing protocol
+        continue_traversal_with_lock_crabbing(req_id, op, child_addr);
+    }
+}
+
+void ComputeServer::handle_write_response(SST::Interfaces::StandardMem::Request::id_t req_id) {
+    // Check if this write is part of a split operation
+    if (pending_ops.count(req_id)) {
+        auto& op = pending_ops[req_id];
+        
+        if (op.type == AsyncOperation::SPLIT_LEAF || op.type == AsyncOperation::SPLIT_INTERNAL) {
+            // This is a split operation write - continue the split state machine
+            handle_split_response(op);
+            pending_ops.erase(req_id);
+        } else {
+            // Regular write completion
+            dbg.debug(CALL_INFO, 3, 0, "Write completed for req_id=%lu\n", req_id);
+        }
+    } else {
+        // Write not tracked (might be from regular operations)
+        dbg.debug(CALL_INFO, 3, 0, "Write completed for req_id=%lu (not tracked)\n", req_id);
+    }
+}
+
+// B+tree operations delegated to BTreeOperations
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ASYNC SPLIT OPERATIONS (delegated to BTreeOperations)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// All split operations moved to btree/btree_operations.cc except handle_split_response
+// which needs access to tree_height and root_address
+
+void ComputeServer::handle_split_response(AsyncOperation& op) {
+    // First delegate to BTreeOperations for standard split phases
+    auto interface_getter = [this](uint64_t addr) { return get_interface_for_address(addr); };
+    btree_ops->handle_split_response(op, pending_ops, serializer, lock_manager, interface_getter,
+                                     stat_network_writes, stat_network_reads);
+    
+    // Handle CREATE_NEW_ROOT phase (special case that needs tree_height access)
+    if (op.split_phase == AsyncOperation::CREATE_NEW_ROOT) {
+        out.output("   → Creating new root (tree height %u → %u)\n",
+                   tree_height, tree_height + 1);
+        
+        // Create new root
+        uint64_t new_root_id = next_node_id++;
+    
+    BTreeNode new_leaf(btree_fanout);
+    new_leaf.node_address = new_leaf_address;
+    new_leaf.is_leaf = true;
+    new_leaf.num_keys = 0;
+    
+    // Step 2: Determine split point
+    uint32_t split_point = btree_fanout / 2;
+    
+    // Step 3: Create temporary array with all keys (old + new)
+    std::vector<uint64_t> all_keys(btree_fanout + 1);
+    std::vector<uint64_t> all_values(btree_fanout + 1);
+    
+    // Find insertion position for new key
+    uint32_t insert_pos = 0;
+    while (insert_pos < old_leaf.num_keys && old_leaf.keys[insert_pos] < new_key) {
+        insert_pos++;
+    }
+    
+    // Copy keys before insert position
+    for (uint32_t i = 0; i < insert_pos; i++) {
+        all_keys[i] = old_leaf.keys[i];
+        all_values[i] = old_leaf.values[i];
+    }
+    
+    // Insert new key
+    all_keys[insert_pos] = new_key;
+    all_values[insert_pos] = new_value;
+    
+    // Copy keys after insert position
+    for (uint32_t i = insert_pos; i < old_leaf.num_keys; i++) {
+        all_keys[i + 1] = old_leaf.keys[i];
+        all_values[i + 1] = old_leaf.values[i];
+    }
+    
+    // Step 4: Split keys between old and new leaf
+    old_leaf.num_keys = split_point;
+    for (uint32_t i = 0; i < split_point; i++) {
+        old_leaf.keys[i] = all_keys[i];
+        old_leaf.values[i] = all_values[i];
+    }
+    
+    new_leaf.num_keys = (btree_fanout + 1) - split_point;
+    for (uint32_t i = 0; i < new_leaf.num_keys; i++) {
+        new_leaf.keys[i] = all_keys[split_point + i];
+        new_leaf.values[i] = all_values[split_point + i];
+    }
+    
+    out.output("   Split complete:\n");
+    out.output("     Old leaf (0x%lx): %u keys [%lu..%lu]\n",
+               old_leaf.node_address, old_leaf.num_keys,
+               old_leaf.keys[0], old_leaf.keys[old_leaf.num_keys - 1]);
+    out.output("     New leaf (0x%lx): %u keys [%lu..%lu]\n",
+               new_leaf.node_address, new_leaf.num_keys,
+               new_leaf.keys[0], new_leaf.keys[new_leaf.num_keys - 1]);
+    
+    // Step 5: Save split state in operation
+    op.type = AsyncOperation::SPLIT_LEAF;
+    op.split_phase = AsyncOperation::WRITE_OLD_NODE;
+    op.separator_key = new_leaf.keys[0];  // First key of new leaf
+    
+    // Check if splitting root
+    if (old_leaf.node_address == root_address) {
+        op.is_root_split = true;
+        out.output("   ⚠️  Splitting ROOT node - will create new root\n");
+        
+        // When splitting root, allocate NEW address for old leaf (root address will be reused for new root)
+        uint64_t old_leaf_new_id = next_node_id++;
+        uint64_t old_leaf_new_address = allocate_node_address(old_leaf_new_id, leaf_level);
+        old_leaf.node_address = old_leaf_new_address;  // Update old leaf to use new address
+        out.output("   → Moving old root to new address 0x%lx\n", old_leaf_new_address);
+    } else {
+        op.is_root_split = false;
+        // Parent is guaranteed to be in path (second-to-last node)
+        if (op.path.size() < 2) {
+            out.fatal(CALL_INFO, -1, "ERROR: Path too short (%zu nodes) for non-root split\n", 
+                     op.path.size());
+        }
+        BTreeNode parent = op.path[op.path.size() - 2];
+        op.parent_address = parent.node_address;
+        out.output("   Parent address: 0x%lx (from traversal path)\n", op.parent_address);
+    }
+    
+    // Save nodes to operation AFTER potentially updating old_leaf address
+    op.old_node = old_leaf;
+    op.new_node = new_leaf;
+    
+    // Step 6: Start async write sequence - write old node first
+    auto req = new SST::Interfaces::StandardMem::Write(
+        old_leaf.node_address, get_serialized_node_size(), serializer->serialize(old_leaf));
+    auto req_id = req->getID();
+    
+    // Transfer operation state to this request
+    pending_ops[req_id] = op;
+    
+    SST::Interfaces::StandardMem* target_interface = get_interface_for_address(old_leaf.node_address);
+    target_interface->send(req);
+    stat_network_writes->addData(1);
+    
+    out.output("   → Phase 1: Writing old node 0x%lx\n", old_leaf.node_address);
+}
+
+void ComputeServer::split_internal_async(AsyncOperation& op, BTreeNode& old_internal, uint64_t new_key, uint64_t new_child) {
+    out.output("\n🔀 ASYNC INTERNAL SPLIT: old_internal=0x%lx, keys=%u/%u, level=%u\n",
+               old_internal.node_address, old_internal.num_keys, btree_fanout, op.current_level);
+    
+    // Create new internal node
+    uint64_t new_node_id = next_node_id++;
+    uint64_t new_internal_address = allocate_node_address(new_node_id, op.current_level);
+    
+    BTreeNode new_internal(btree_fanout);
+    new_internal.node_address = new_internal_address;
+    new_internal.is_leaf = false;
+    new_internal.num_keys = 0;
+    
+    // Determine split point
+    uint32_t split_point = btree_fanout / 2;
+    
+    // Create temporary arrays
+    std::vector<uint64_t> all_keys(btree_fanout + 1);
+    std::vector<uint64_t> all_children(btree_fanout + 2);
+    
+    // Find insertion position
+    uint32_t insert_pos = 0;
+    while (insert_pos < old_internal.num_keys && old_internal.keys[insert_pos] < new_key) {
+        insert_pos++;
+    }
+    
+    // Copy keys and children before insert position
+    for (uint32_t i = 0; i < insert_pos; i++) {
+        all_keys[i] = old_internal.keys[i];
+        all_children[i] = old_internal.children[i];
+    }
+    all_children[insert_pos] = old_internal.children[insert_pos];
+    
+    // Insert new key and child
+    all_keys[insert_pos] = new_key;
+    all_children[insert_pos + 1] = new_child;
+    
+    // Copy keys and children after insert position
+    for (uint32_t i = insert_pos; i < old_internal.num_keys; i++) {
+        all_keys[i + 1] = old_internal.keys[i];
+        all_children[i + 2] = old_internal.children[i + 1];
+    }
+    
+    // Split: middle key gets promoted to parent
+    uint64_t promoted_key = all_keys[split_point];
+    
+    old_internal.num_keys = split_point;
+    for (uint32_t i = 0; i < split_point; i++) {
+        old_internal.keys[i] = all_keys[i];
+        old_internal.children[i] = all_children[i];
+    }
+    old_internal.children[split_point] = all_children[split_point];
+    
+    new_internal.num_keys = btree_fanout - split_point;
+    for (uint32_t i = 0; i < new_internal.num_keys; i++) {
+        new_internal.keys[i] = all_keys[split_point + 1 + i];
+        new_internal.children[i] = all_children[split_point + 1 + i];
+    }
+    new_internal.children[new_internal.num_keys] = all_children[btree_fanout + 1];
+    
+    out.output("   Split complete (promoted key=%lu):\n", promoted_key);
+    out.output("     Old internal (0x%lx): %u keys\n",
+               old_internal.node_address, old_internal.num_keys);
+    out.output("     New internal (0x%lx): %u keys\n",
+               new_internal.node_address, new_internal.num_keys);
+    
+    // Save split state
+    op.type = AsyncOperation::SPLIT_INTERNAL;
+    op.split_phase = AsyncOperation::WRITE_OLD_NODE;
+    op.separator_key = promoted_key;
+    
+    // Check if splitting root
+    if (old_internal.node_address == root_address) {
+        op.is_root_split = true;
+        out.output("   ⚠️  Splitting ROOT node - will create new root\n");
+        
+        // When splitting root, allocate NEW address for old internal (root address will be reused for new root)
+        uint64_t old_internal_new_id = next_node_id++;
+        uint64_t old_internal_new_address = allocate_node_address(old_internal_new_id, op.current_level);
+        old_internal.node_address = old_internal_new_address;  // Update old internal to use new address
+        out.output("   → Moving old root to new address 0x%lx\n", old_internal_new_address);
+    } else {
+        op.is_root_split = false;
+        // Parent is guaranteed to be in path (second-to-last node)
+        if (op.path.size() < 2) {
+            out.fatal(CALL_INFO, -1, "ERROR: Path too short (%zu nodes) for non-root split\n", 
+                     op.path.size());
+        }
+        BTreeNode parent = op.path[op.path.size() - 2];
+        op.parent_address = parent.node_address;
+        out.output("   Parent address: 0x%lx (from traversal path)\n", op.parent_address);
+    }
+    
+    // Save nodes to operation AFTER potentially updating old_internal address
+    op.old_node = old_internal;
+    op.new_node = new_internal;
+    
+    // Start async write sequence
+    auto req = new SST::Interfaces::StandardMem::Write(
+        old_internal.node_address, get_serialized_node_size(), serializer->serialize(old_internal));
+    auto req_id = req->getID();
+    
+    pending_ops[req_id] = op;
+    
+    SST::Interfaces::StandardMem* target_interface = get_interface_for_address(old_internal.node_address);
+    target_interface->send(req);
+    stat_network_writes->addData(1);
+    
+    out.output("   → Phase 1: Writing old node 0x%lx\n", old_internal.node_address);
+}
+
+void ComputeServer::handle_split_response(AsyncOperation& op) {
+    switch (op.split_phase) {
+        case AsyncOperation::WRITE_OLD_NODE:
+            out.output("   ✓ Phase 1 complete: Old node written\n");
+            out.output("   → Phase 2: Writing new node 0x%lx\n", op.new_node.node_address);
+            
+            // Write new node
+            op.split_phase = AsyncOperation::WRITE_NEW_NODE;
+            {
+                auto req = new SST::Interfaces::StandardMem::Write(
+                    op.new_node.node_address, get_serialized_node_size(), serializer->serialize(op.new_node));
+                auto req_id = req->getID();
+                pending_ops[req_id] = op;
+                
+                SST::Interfaces::StandardMem* target_interface = get_interface_for_address(op.new_node.node_address);
+                target_interface->send(req);
+                stat_network_writes->addData(1);
+            }
+            break;
+            
+        case AsyncOperation::WRITE_NEW_NODE:
+            out.output("   ✓ Phase 2 complete: New node written\n");
+            
+            // Now update parent
+            if (op.is_root_split) {
+                out.output("   → Creating new root (tree height %u → %u)\n",
+                           tree_height, tree_height + 1);
+                
+                // Create new root
+                uint64_t new_root_id = next_node_id++;
+                uint64_t new_root_addr = allocate_node_address(new_root_id, 0);
+                
+                BTreeNode new_root(btree_fanout);
+                new_root.node_address = new_root_addr;
+                new_root.is_leaf = false;
+                new_root.num_keys = 1;
+                new_root.keys[0] = op.separator_key;
+                new_root.children[0] = op.old_node.node_address;
+                new_root.children[1] = op.new_node.node_address;
+                
+                out.output("   DEBUG: New root children: [0]=0x%lx, [1]=0x%lx\n",
+                           new_root.children[0], new_root.children[1]);
+                
+                // Write new root
+                auto req = new SST::Interfaces::StandardMem::Write(
+                    new_root_addr, get_serialized_node_size(), serializer->serialize(new_root));
+                
+                SST::Interfaces::StandardMem* target_interface = get_interface_for_address(new_root_addr);
+                target_interface->send(req);
+                stat_network_writes->addData(1);
+                
+                // Update tree metadata
+                root_address = new_root_addr;
+                tree_height++;
+                
+                out.output("   ✓ New root created at 0x%lx, tree height now %u\n",
+                           root_address, tree_height);
+                
+                // Split complete - operation done
+                SimTime_t latency = getCurrentSimTime() - op.start_time;
+                stat_total_latency->addData(latency);
+                stat_ops_completed->addData(1);
+                
+            } else {
+                // Non-root split - need to acquire lock on parent before updating
+                // Parent is guaranteed to be in op.path (second-to-last node)
+                if (op.path.size() < 2) {
+                    out.fatal(CALL_INFO, -1, "ERROR: Path too short (%zu nodes) for non-root split\n", 
+                             op.path.size());
+                }
+                
+                BTreeNode parent = op.path[op.path.size() - 2];
+                out.output("   → Phase 3: Acquiring EXCLUSIVE lock on parent 0x%lx\n",
+                           parent.node_address);
+                
+                // Acquire exclusive lock on parent (splits need write access)
+                op.split_phase = AsyncOperation::ACQUIRE_PARENT_LOCK;
+                SST::Interfaces::StandardMem* interface = get_interface_for_address(parent.node_address);
+                lock_manager->try_acquire_lock_async(op, parent.node_address, true, interface, pending_ops);  // true = exclusive lock
+                stat_network_reads->addData(1);
+            }
+            break;
+            
+        default:
+            break;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// NODE WRITE HELPERS - Using BTreeSerializer
+// ═══════════════════════════════════════════════════════════════════════════
+
+void ComputeServer::write_node_back(const BTreeNode& node) {
+    // Serialize and write node back to memory using BTreeSerializer
+    auto data = serializer->serialize(node);
+    
+    auto req = new SST::Interfaces::StandardMem::Write(node.node_address, data.size(), data);
+    
+    SST::Interfaces::StandardMem* target_interface = get_interface_for_address(node.node_address);
+    target_interface->send(req);
+    stat_network_writes->addData(1);
+    
+    out.output("   ✍️  Wrote node back to address 0x%lx\n", node.node_address);
+}

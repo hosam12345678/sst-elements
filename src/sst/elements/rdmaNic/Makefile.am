@@ -28,7 +28,17 @@ librdmaNic_la_SOURCES = \
 	computeServer.cc \
 	computeServer.h \
 	memoryServer.cc \
-	memoryServer.h
+	memoryServer.h \
+	btree/btree_node.h \
+	btree/btree_serializer.h \
+	btree/btree_serializer.cc \
+	btree/btree_locks.h \
+	btree/btree_locks.cc \
+	btree/btree_operations.h \
+	btree/btree_operations.cc \
+	workload/workload_types.h \
+	workload/workload_generator.h \
+	workload/workload_generator.cc
 
 EXTRA_DIST = \
 	tests/memory.py \

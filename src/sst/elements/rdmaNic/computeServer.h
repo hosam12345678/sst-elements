@@ -22,75 +22,16 @@
 #include <vector>
 #include <string>
 
+// Include refactored B+tree and workload modules
+#include "btree/btree_node.h"
+#include "btree/btree_serializer.h"
+#include "btree/btree_locks.h"
+#include "btree/btree_operations.h"
+#include "workload/workload_types.h"
+#include "workload/workload_generator.h"
+
 namespace SST {
 namespace MemHierarchy {
-
-// B+tree operation types
-enum BTreeOp {
-    BTREE_INSERT,
-    BTREE_SEARCH
-};
-
-// Workload operation structure
-struct WorkloadOp {
-    BTreeOp op_type;
-    uint64_t key;
-    uint64_t value;
-    SimTime_t timestamp;
-    uint64_t node_id;  // Which compute node issued this
-};
-
-// B+tree node structure (dynamic fanout) - MUST be defined before AsyncOperation
-struct BTreeNode {
-    std::vector<uint64_t> keys;        // Keys (size = fanout)
-    std::vector<uint64_t> values;      // Values for leaf nodes (size = fanout)
-    std::vector<uint64_t> children;    // Child pointers for internal nodes (size = fanout+1)
-    uint32_t num_keys;                 // Number of keys currently in node
-    uint32_t fanout;                   // Maximum keys per node
-    bool is_leaf;                      // Leaf or internal node
-    uint64_t node_address;             // Address in memory server
-    
-    // Constructor
-    BTreeNode(uint32_t fanout_size = 16) : fanout(fanout_size) {
-        keys.resize(fanout);
-        values.resize(fanout);
-        children.resize(fanout + 1);
-        num_keys = 0;
-        is_leaf = true;
-        node_address = 0;
-    }
-    
-    // Lock is located at the beginning of the node (no separate address)
-    // Lock offset: 0
-    // Data offset: sizeof(lock)
-};
-
-// Async operation tracking - state machine for multi-step operations
-struct AsyncOperation {
-    enum Type { TRAVERSAL, INSERT, SEARCH, SPLIT_LEAF, SPLIT_INTERNAL, UPDATE_PARENT };
-    enum SplitPhase { NONE, WRITE_OLD_NODE, WRITE_NEW_NODE, READ_PARENT, UPDATE_PARENT_NODE };
-    
-    Type type;                          // What operation is this?
-    uint64_t key;                       // Key being operated on
-    uint64_t value;                     // Value (for inserts)
-    uint32_t current_level;             // Which tree level we're at
-    uint64_t current_address;           // Current node address
-    std::vector<BTreeNode> path;        // Nodes visited so far (for splits)
-    SimTime_t start_time;               // When operation started
-    
-    // Split operation state
-    SplitPhase split_phase;             // Which phase of split we're in
-    BTreeNode old_node;                 // Node being split
-    BTreeNode new_node;                 // New node created from split
-    uint64_t separator_key;             // Key to insert into parent
-    uint64_t parent_address;            // Address of parent node
-    bool is_root_split;                 // Is this splitting the root?
-    
-    // Constructor
-    AsyncOperation() : type(TRAVERSAL), key(0), value(0), current_level(0), 
-                      current_address(0), start_time(0), split_phase(NONE),
-                      separator_key(0), parent_address(0), is_root_split(false) {}
-};
 
 class ComputeServer : public SST::Component {
 public:
@@ -156,11 +97,6 @@ public:
     void btree_insert_async(uint64_t key, uint64_t value);
     void btree_search_async(uint64_t key);
 
-    // Workload generation
-    void generate_workload();
-    WorkloadOp generate_next_operation();
-    uint64_t get_zipfian_key();
-
 private:
     // Configuration
     uint32_t node_id;
@@ -176,9 +112,7 @@ private:
 
     // Workload state
     std::queue<WorkloadOp> pending_operations;
-    std::mt19937 rng;
-    std::uniform_real_distribution<double> uniform_dist;
-    std::vector<uint64_t> key_frequencies;  // Track key access frequency
+    WorkloadGenerator* workload_gen;  // Handles workload generation
 
     // B+tree state
     uint64_t root_address;
@@ -192,6 +126,15 @@ private:
     
     // Async operation tracking - state machine
     std::map<SST::Interfaces::StandardMem::Request::id_t, AsyncOperation> pending_ops;
+    
+    // B+tree serializer
+    BTreeSerializer* serializer;
+    
+    // B+tree lock manager
+    BTreeLockManager* lock_manager;
+    
+    // B+tree operations
+    BTreeOperations* btree_ops;
     
     // Statistics
     Statistic<uint64_t>* stat_inserts;
@@ -221,18 +164,53 @@ private:
     void handle_write_response(SST::Interfaces::StandardMem::Request::id_t req_id);
     void handle_leaf_operation(AsyncOperation& op, BTreeNode& leaf);
     
+    // B+tree traversal helpers
+    void handle_btree_traversal(SST::Interfaces::StandardMem::Request::id_t req_id,
+                                AsyncOperation& op, BTreeNode& node);
+    bool search_key_in_node(const BTreeNode& node, uint64_t key);
+    
+    // Leaf node operation handlers
+    void handle_leaf_search(SST::Interfaces::StandardMem::Request::id_t req_id,
+                           AsyncOperation& op, BTreeNode& node);
+    void handle_leaf_insert(SST::Interfaces::StandardMem::Request::id_t req_id,
+                           AsyncOperation& op, BTreeNode& node);
+    
+    // Leaf modification helpers
+    void insert_into_leaf(BTreeNode& leaf, uint64_t key, uint64_t value);
+    void write_leaf_and_complete(SST::Interfaces::StandardMem::Request::id_t req_id,
+                                 AsyncOperation& op, BTreeNode& leaf);
+    
+    // Split operation handlers
+    void handle_leaf_split(SST::Interfaces::StandardMem::Request::id_t req_id,
+                          AsyncOperation& op, BTreeNode& node);
+    void handle_internal_split(SST::Interfaces::StandardMem::Request::id_t req_id,
+                               AsyncOperation& op, BTreeNode& node);
+    void handle_root_split(SST::Interfaces::StandardMem::Request::id_t req_id,
+                          AsyncOperation& op);
+    void write_split_nodes(SST::Interfaces::StandardMem::Request::id_t req_id,
+                          AsyncOperation& op);
+    void update_parent_after_split(SST::Interfaces::StandardMem::Request::id_t req_id,
+                                   AsyncOperation& op);
+    
+    // Internal node modification helpers
+    void insert_into_internal_node(BTreeNode& internal, uint64_t key, uint64_t right_child);
+    void write_parent_and_complete(SST::Interfaces::StandardMem::Request::id_t req_id,
+                                   AsyncOperation& op, BTreeNode& parent);
+    
     // Async split operations
     void split_leaf_async(AsyncOperation& op, BTreeNode& leaf, uint64_t new_key, uint64_t new_value);
     void split_internal_async(AsyncOperation& op, BTreeNode& internal, uint64_t new_key, uint64_t new_child);
     void handle_split_response(AsyncOperation& op);
     void update_parent_async(uint64_t old_node_addr, uint64_t separator_key, uint64_t new_node_addr, uint32_t level);
     
-    // Data serialization/deserialization
-    BTreeNode deserialize_node(const std::vector<uint8_t>& data);
-    std::vector<uint8_t> serialize_node(const BTreeNode& node);
-    size_t get_serialized_node_size() const;
+    // Node writing helpers
     void write_node_back(const BTreeNode& node);
     void write_node_back_with_callback(const BTreeNode& node, AsyncOperation& op);
+    
+    // Helper to get serialized size (delegates to serializer)
+    inline size_t get_serialized_node_size() const {
+        return serializer ? serializer->get_serialized_size() : 0;
+    }
     
     // Debug output
     Output dbg;

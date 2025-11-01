@@ -18,9 +18,14 @@
 #include <sst/core/interfaces/stdMem.h>
 #include <unordered_map>
 #include <vector>
+#include <cstring>  // For memcpy of lock data
 
 namespace SST {
 namespace MemHierarchy {
+
+// Forward declarations
+class LockRequestEvent;
+class LockResponseEvent;
 
 // Memory block structure for storing B+tree nodes
 struct MemoryBlock {
@@ -28,17 +33,46 @@ struct MemoryBlock {
     std::vector<uint8_t> data;
     SimTime_t last_access;
     uint64_t access_count;
-    bool is_locked;
-    uint64_t lock_owner;
 };
 
-// Lock structure for B+tree node locking
+// ===== IN-MEMORY LOCK STRUCTURE =====
+// Lock is embedded at the beginning of each B+tree node
+// Memory layout: [Lock (8 bytes)] [Node Data (remaining bytes)]
+//
+// Lock encoding (64-bit value):
+// - 0                : Unlocked
+// - 1-0x7FFFFFFFFFFFFFFF : Shared lock (reader count)
+// - 0x8000000000000000 | compute_id : Exclusive lock (high bit + owner ID)
 struct NodeLock {
-    uint64_t lock_address;
-    bool is_locked;
-    uint64_t owner_id;  // Which compute node owns the lock
-    SimTime_t lock_time;
-    std::queue<uint64_t> waiting_queue;  // Nodes waiting for lock
+    uint64_t state;
+    
+    NodeLock() : state(0) {}
+    
+    static constexpr uint64_t EXCLUSIVE_BIT = 0x8000000000000000ULL;
+    static constexpr uint64_t OWNER_MASK = ~EXCLUSIVE_BIT;
+    
+    bool is_unlocked() const { return state == 0; }
+    bool is_shared() const { return state > 0 && !(state & EXCLUSIVE_BIT); }
+    bool is_exclusive() const { return (state & EXCLUSIVE_BIT) != 0; }
+    uint64_t get_owner() const { return state & OWNER_MASK; }
+    uint64_t get_reader_count() const { return is_shared() ? state : 0; }
+    
+    static uint64_t make_exclusive(uint64_t compute_id) { 
+        return EXCLUSIVE_BIT | compute_id; 
+    }
+};
+
+// Size of lock header in bytes
+constexpr size_t LOCK_HEADER_SIZE = sizeof(uint64_t);  // 8 bytes
+
+// Lock operation types
+enum LockOperation {
+    LOCK_TRY_ACQUIRE_SHARED,      // Try to acquire shared lock (for reads)
+    LOCK_TRY_ACQUIRE_EXCLUSIVE,   // Try to acquire exclusive lock (for writes)
+    LOCK_RELEASE_SHARED,          // Release shared lock
+    LOCK_RELEASE_EXCLUSIVE,       // Release exclusive lock
+    LOCK_SUCCESS,                 // Lock operation succeeded (response)
+    LOCK_FAILED                   // Lock operation failed (response)
 };
 
 class MemoryServer : public SST::Component {
@@ -58,13 +92,18 @@ public:
         {"memory_capacity_gb", "Memory capacity in GB", "16"},
         {"memory_latency_ns", "Memory access latency in nanoseconds", "100"},
         {"btree_node_size", "Size of B+tree nodes in bytes", "4096"},
-        {"enable_locking", "Enable B+tree node locking", "true"},
-        {"lock_timeout_us", "Lock timeout in microseconds", "10000"},
         {"verbose", "Verbose debug output", "0"}
     )
 
     SST_ELI_DOCUMENT_SUBCOMPONENT_SLOTS(
-        {"mem_interface", "Memory interface - single interface per memory server instance", "SST::Interfaces::StandardMem"}
+        {"mem_interface_0", "Memory interface from compute server 0", "SST::Interfaces::StandardMem"},
+        {"mem_interface_1", "Memory interface from compute server 1", "SST::Interfaces::StandardMem"},
+        {"mem_interface_2", "Memory interface from compute server 2", "SST::Interfaces::StandardMem"},
+        {"mem_interface_3", "Memory interface from compute server 3", "SST::Interfaces::StandardMem"},
+        {"mem_interface_4", "Memory interface from compute server 4", "SST::Interfaces::StandardMem"},
+        {"mem_interface_5", "Memory interface from compute server 5", "SST::Interfaces::StandardMem"},
+        {"mem_interface_6", "Memory interface from compute server 6", "SST::Interfaces::StandardMem"},
+        {"mem_interface_7", "Memory interface from compute server 7", "SST::Interfaces::StandardMem"}
     )
 
     SST_ELI_DOCUMENT_STATISTICS(
@@ -72,12 +111,13 @@ public:
         {"network_writes_received", "Number of remote write requests received", "requests", 1},
         {"memory_reads", "Number of local memory reads", "reads", 1},
         {"memory_writes", "Number of local memory writes", "writes", 1},
-        {"lock_acquisitions", "Number of lock acquisition requests", "locks", 1},
-        {"lock_releases", "Number of lock release requests", "locks", 1},
-        {"lock_conflicts", "Number of lock conflicts/waits", "conflicts", 1},
         {"bytes_read", "Total bytes read from memory", "bytes", 1},
         {"bytes_written", "Total bytes written to memory", "bytes", 1},
-        {"memory_utilization", "Memory utilization percentage", "percent", 1}
+        {"memory_utilization", "Memory utilization percentage", "percent", 1},
+        {"locks_acquired", "Number of locks acquired", "locks", 1},
+        {"locks_released", "Number of locks released", "locks", 1},
+        {"lock_conflicts", "Number of lock conflicts (already held)", "conflicts", 1},
+        {"lock_wait_time", "Total time spent waiting for locks", "nanoseconds", 1}
     )
 
     // Constructor
@@ -96,16 +136,28 @@ public:
     // Remote memory request handlers
     void handle_remote_read(SST::Interfaces::StandardMem::Read* req, int interface_id);
     void handle_remote_write(SST::Interfaces::StandardMem::Write* req, int interface_id);
-    void handle_remote_request(SST::Interfaces::StandardMem::Request* req);
+
+    // ===== IN-MEMORY LOCK OPERATIONS =====
+    // Shared lock operations (for SEARCH/reads)
+    bool try_acquire_shared_lock(uint64_t node_address);
+    bool release_shared_lock(uint64_t node_address);
+    
+    // Exclusive lock operations (for INSERT/writes)
+    bool try_acquire_exclusive_lock(uint64_t node_address, uint64_t compute_id);
+    bool release_exclusive_lock(uint64_t node_address, uint64_t compute_id);
+    
+    // Lock state queries (for debugging/verification)
+    uint64_t read_lock_state(uint64_t node_address);
+    bool is_locked_shared(uint64_t node_address);
+    bool is_locked_exclusive(uint64_t node_address);
+    
+    // Helper: get lock address for a node
+    uint64_t get_lock_address(uint64_t node_address) { return node_address; }
+    uint64_t get_data_address(uint64_t node_address) { return node_address + LOCK_HEADER_SIZE; }
 
     // Memory operations
     std::vector<uint8_t> read_memory(uint64_t address, size_t size);
     void write_memory(uint64_t address, const std::vector<uint8_t>& data);
-
-    // Lock management
-    bool acquire_lock(uint64_t lock_address, uint64_t requester_id);
-    void release_lock(uint64_t lock_address, uint64_t requester_id);
-    bool is_lock_address(uint64_t address);
 
     // B+tree node management
     void store_btree_node(uint64_t address, const std::vector<uint8_t>& node_data);
@@ -118,17 +170,18 @@ private:
     uint64_t memory_capacity;        // In bytes
     SimTime_t memory_latency;        // Access latency
     size_t btree_node_size;
-    bool enable_locking;
-    SimTime_t lock_timeout;
     int verbose_level;
 
     // Memory storage
     std::unordered_map<uint64_t, MemoryBlock> memory_blocks;
     uint64_t memory_used;            // Bytes currently used
     uint64_t base_address;           // Base address for this memory server
-
-    // Lock management
-    std::unordered_map<uint64_t, NodeLock> node_locks;
+    
+    // ===== LOCK STATISTICS =====
+    // No separate lock table - locks are embedded in memory
+    uint64_t total_locks_acquired;   // Statistics
+    uint64_t total_locks_released;
+    uint64_t total_lock_conflicts;   // Times lock acquisition failed (already held)
     
     // Memory interfaces (multiple for accepting connections from different compute servers)
     SST::Interfaces::StandardMem* mem_interface;  // Primary interface
@@ -141,18 +194,19 @@ private:
     Statistic<uint64_t>* stat_network_writes;
     Statistic<uint64_t>* stat_memory_reads;
     Statistic<uint64_t>* stat_memory_writes;
-    Statistic<uint64_t>* stat_lock_acquisitions;
-    Statistic<uint64_t>* stat_lock_releases;
-    Statistic<uint64_t>* stat_lock_conflicts;
     Statistic<uint64_t>* stat_bytes_read;
     Statistic<uint64_t>* stat_bytes_written;
     Statistic<uint64_t>* stat_memory_utilization;
+    
+    // Lock statistics
+    Statistic<uint64_t>* stat_locks_acquired;
+    Statistic<uint64_t>* stat_locks_released;
+    Statistic<uint64_t>* stat_lock_conflicts;
+    Statistic<uint64_t>* stat_lock_wait_time;
 
     // Helper functions
-    uint64_t get_lock_address_for_node(uint64_t node_address);
     bool is_address_in_range(uint64_t address);
     void update_memory_stats();
-    void cleanup_expired_locks();
     void send_response(SST::Interfaces::StandardMem::Request* req, bool success, int interface_id = -1);
     
     // Debug output
