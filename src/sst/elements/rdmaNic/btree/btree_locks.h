@@ -68,15 +68,15 @@ public:
         std::map<SST::Interfaces::StandardMem::Request::id_t, AsyncOperation>& pending_ops);
     
     /**
-     * Handle response to a lock acquisition attempt
-     * @param req_id Request ID of the lock attempt
-     * @param data Response data (lock state)
+     * Handle LoadLink response during lock acquisition (LL/SC protocol)
+     * @param req_id Request ID of the LoadLink
+     * @param data Response data (lock state from LL)
      * @param pending_ops Map of pending operations
      * @param interface Network interface for subsequent requests
      * @param serialized_node_size Size of serialized node (for reading after lock)
      * @return true if lock acquired, false if retry needed
      */
-    bool handle_lock_response(
+    bool handle_loadlink_response(
         SST::Interfaces::StandardMem::Request::id_t req_id,
         const std::vector<uint8_t>& data,
         std::map<SST::Interfaces::StandardMem::Request::id_t, AsyncOperation>& pending_ops,
@@ -84,12 +84,69 @@ public:
         size_t serialized_node_size);
     
     /**
-     * Release all locks held by an operation
+     * Handle StoreConditional response during lock acquisition (LL/SC protocol)
+     * @param req_id Request ID for the SC response
+     * @param resp WriteResp from SC (contains success/fail flag)
+     * @param pending_ops Map of pending operations
+     * @param interface Network interface for subsequent requests
+     * @param serialized_node_size Size of serialized node (for reading after lock)
+     */
+    void handle_storeconditional_response(
+        SST::Interfaces::StandardMem::Request::id_t req_id,
+        SST::Interfaces::StandardMem::WriteResp* resp,
+        std::map<SST::Interfaces::StandardMem::Request::id_t, AsyncOperation>& pending_ops,
+        SST::Interfaces::StandardMem* interface,
+        size_t serialized_node_size);
+    
+    /**
+     * Release all locks held by an operation (using LL/SC protocol)
+     * @param old_req_id The current request ID for this operation (will be replaced with new one)
      * @param op Operation whose locks should be released
      * @param interface_getter Function to get network interface for an address
+     * @param pending_ops Map of pending operations (for tracking async release)
      */
     void release_all_locks(
+        SST::Interfaces::StandardMem::Request::id_t old_req_id,
         AsyncOperation& op,
+        std::function<SST::Interfaces::StandardMem*(uint64_t)> interface_getter,
+        std::map<SST::Interfaces::StandardMem::Request::id_t, AsyncOperation>& pending_ops);
+    
+    /**
+     * Release a single lock asynchronously (internal helper for release_all_locks)
+     * @param op Operation performing lock release
+     * @param interface_getter Function to get network interface for an address
+     * @param pending_ops Map of pending operations
+     */
+    void release_single_lock_async(
+        SST::Interfaces::StandardMem::Request::id_t old_req_id,
+        AsyncOperation& op,
+        std::function<SST::Interfaces::StandardMem*(uint64_t)> interface_getter,
+        std::map<SST::Interfaces::StandardMem::Request::id_t, AsyncOperation>& pending_ops);
+    
+    /**
+     * Handle LoadLink response during lock release
+     * @param req_id Request ID of the LoadLink
+     * @param data Response data (current lock state)
+     * @param pending_ops Map of pending operations
+     * @param interface_getter Function to get network interface for an address
+     */
+    void handle_release_loadlink_response(
+        SST::Interfaces::StandardMem::Request::id_t req_id,
+        const std::vector<uint8_t>& data,
+        std::map<SST::Interfaces::StandardMem::Request::id_t, AsyncOperation>& pending_ops,
+        std::function<SST::Interfaces::StandardMem*(uint64_t)> interface_getter);
+    
+    /**
+     * Handle StoreConditional response during lock release
+     * @param req_id Request ID for the SC response
+     * @param resp WriteResp from SC (contains success/fail flag)
+     * @param pending_ops Map of pending operations
+     * @param interface_getter Function to get network interface for an address
+     */
+    void handle_release_storeconditional_response(
+        SST::Interfaces::StandardMem::Request::id_t req_id,
+        SST::Interfaces::StandardMem::WriteResp* resp,
+        std::map<SST::Interfaces::StandardMem::Request::id_t, AsyncOperation>& pending_ops,
         std::function<SST::Interfaces::StandardMem*(uint64_t)> interface_getter);
     
     /**
@@ -102,6 +159,16 @@ public:
         AsyncOperation& op,
         uint64_t parent_address,
         std::function<SST::Interfaces::StandardMem*(uint64_t)> interface_getter);
+    
+    /**
+     * Check if operation is ready to complete (all locks released)
+     * @param op Operation to check
+     * @return true if operation can be completed
+     */
+    bool is_operation_complete(const AsyncOperation& op) const {
+        return op.ready_to_complete && op.held_locks.empty() && 
+               !op.waiting_for_release_ll && !op.waiting_for_release_sc;
+    }
     
     /**
      * Get lock header size

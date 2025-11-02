@@ -22,6 +22,15 @@ using namespace SST::MemHierarchy;
 #define MEMORY_SERVER_SIZE 0x1000000ULL
 #define GET_MEMORY_SERVER(addr) (((addr) - MEMORY_BASE_ADDRESS) / MEMORY_SERVER_SIZE)
 
+// Validity bit for B+tree initialization synchronization
+// Put it at a dedicated address that won't interfere with node storage
+// Using the last byte of memory server 0's address space
+#define VALIDITY_BIT_ADDRESS (MEMORY_BASE_ADDRESS + MEMORY_SERVER_SIZE - 1)
+
+// Lock header size - reserved space before node data
+// The lock system uses this space for lock metadata (currently unimplemented)
+#define LOCK_HEADER_SIZE 8
+
 // ═══════════════════════════════════════════════════════════════════════════
 // CONSTRUCTOR
 // ═══════════════════════════════════════════════════════════════════════════
@@ -51,7 +60,9 @@ ComputeServer::ComputeServer(ComponentId_t id, Params& params) :
     // Initialize B+tree state
     tree_height = 1;
     next_node_id = 0;
-    root_address = MEMORY_BASE_ADDRESS;
+    root_address = MEMORY_BASE_ADDRESS;  // Root at base address, validity bit is separate
+    tree_initialized = false;  // Will be set true after validity bit check passes
+    checking_validity_bit = false;  // Will be set true when checking validity
 
     // Setup debug output
     dbg.init("", 5, 0, (Output::output_location_t)1);
@@ -140,9 +151,7 @@ void ComputeServer::init(unsigned int phase) {
 }
 
 void ComputeServer::setup() {
-    memory_interface->setup();
-    
-    // Setup all additional interfaces
+    // Setup all interfaces
     for (auto& interface : memory_interfaces) {
         interface->setup();
     }
@@ -152,9 +161,7 @@ void ComputeServer::setup() {
 }
 
 void ComputeServer::finish() {
-    memory_interface->finish();
-    
-    // Finish all additional interfaces
+    // Finish all interfaces
     for (auto& interface : memory_interfaces) {
         interface->finish();
     }
@@ -167,16 +174,33 @@ void ComputeServer::finish() {
 }
 
 bool ComputeServer::tick(Cycle_t current_cycle) {
-    if (!pending_operations.empty()) {
-        if (pending_ops.size() < 10) {
-            WorkloadOp next_op = pending_operations.front();
-            pending_operations.pop();
-            process_btree_operation(next_op);
+    // Wait for tree initialization to complete before starting operations
+    if (!tree_initialized) {
+        // Non-initializing nodes need to check the validity bit
+        if (node_id != 0) {
+            check_tree_initialization();
         }
+        return false;  // Tree not ready yet
     }
     
-    if (getCurrentSimTime() >= simulation_duration && 
-        pending_operations.empty() && pending_ops.empty()) {
+    if (!pending_operations.empty()) {
+        WorkloadOp next_op = pending_operations.front();
+        pending_operations.pop();
+        process_btree_operation(next_op);   
+    }
+
+    
+    SimTime_t current_time = getCurrentSimTime();
+    bool time_expired = current_time >= simulation_duration;
+    bool no_pending_workload = pending_operations.empty();
+    bool no_pending_async = pending_ops.empty();
+    // out.output("Tick: current_time=%d, pending_ops_size=%ld\n",
+    //            simulation_duration, pending_ops.size());
+    if (time_expired && no_pending_workload && no_pending_async) {
+        if (verbose_level >= 1) {
+            out.output("Node %u: Simulation complete at time %lu ns (duration %lu ns)\n",
+                      node_id, current_time, simulation_duration);
+        }
         return true;
     }
     
@@ -188,8 +212,8 @@ void ComputeServer::handleMemoryEvent(Interfaces::StandardMem::Request* req) {
     
     if (auto* read_resp = dynamic_cast<Interfaces::StandardMem::ReadResp*>(req)) {
         handle_read_response(req_id, read_resp->data);
-    } else if (dynamic_cast<Interfaces::StandardMem::WriteResp*>(req)) {
-        handle_write_response(req_id);
+    } else if (auto* write_resp = dynamic_cast<Interfaces::StandardMem::WriteResp*>(req)) {
+        handle_write_response(req_id, write_resp);
     }
     
     delete req;
@@ -230,11 +254,36 @@ void ComputeServer::handle_read_response(Interfaces::StandardMem::Request::id_t 
     
     auto& op = pending_ops[req_id];
     
-    // Handle lock acquisition responses
-    if (op.waiting_for_lock) {
-        lock_manager->handle_lock_response(req_id, data, pending_ops, 
-                                          get_interface_for_address(op.lock_target_address),
-                                          get_serialized_node_size());
+    // Handle validity bit check response (for non-initializing nodes)
+    if (checking_validity_bit && !tree_initialized) {
+        checking_validity_bit = false;
+        uint8_t validity_bit = data[0];
+        
+        if (validity_bit == 1) {
+            out.output("Node %d: Validity bit is 1, tree is ready!\n", node_id);
+            tree_initialized = true;
+        } else {
+            out.output("Node %d: Validity bit is 0, tree not ready yet, will retry\n", node_id);
+            // Will check again in next tick
+        }
+        
+        pending_ops.erase(req_id);
+        return;
+    }
+    
+    // Handle LoadLink responses (lock acquisition - step 1 of LL/SC protocol)
+    if (op.waiting_for_loadlink_response) {
+        lock_manager->handle_loadlink_response(req_id, data, pending_ops, 
+                                              get_interface_for_address(op.lock_target_address),
+                                              get_serialized_node_size());
+        stat_network_reads->addData(1);
+        return;
+    }
+    
+    // Handle LoadLink responses during lock release
+    if (op.waiting_for_release_ll) {
+        auto interface_getter = [this](uint64_t addr) { return get_interface_for_address(addr); };
+        lock_manager->handle_release_loadlink_response(req_id, data, pending_ops, interface_getter);
         stat_network_reads->addData(1);
         return;
     }
@@ -264,10 +313,56 @@ void ComputeServer::handle_read_response(Interfaces::StandardMem::Request::id_t 
     }
 }
 
-void ComputeServer::handle_write_response(Interfaces::StandardMem::Request::id_t req_id) {
+void ComputeServer::handle_write_response(Interfaces::StandardMem::Request::id_t req_id,
+                                          Interfaces::StandardMem::WriteResp* resp) {
     if (!pending_ops.count(req_id)) return;
     
     auto& op = pending_ops[req_id];
+    
+    // Handle StoreConditional responses (lock acquisition - step 2 of LL/SC protocol)
+    if (op.waiting_for_sc_response) {
+        lock_manager->handle_storeconditional_response(req_id, resp, pending_ops, 
+                                                       get_interface_for_address(op.lock_target_address),
+                                                       get_serialized_node_size());
+        stat_network_writes->addData(1);
+        return;
+    }
+    
+    // Handle StoreConditional responses during lock release
+    if (op.waiting_for_release_sc) {
+        auto interface_getter = [this](uint64_t addr) { return get_interface_for_address(addr); };
+        lock_manager->handle_release_storeconditional_response(req_id, resp, pending_ops, interface_getter);
+        stat_network_writes->addData(1);
+        
+        // Check if operation can complete now (all locks released)
+        if (pending_ops.count(req_id) && lock_manager->is_operation_complete(pending_ops[req_id])) {
+            auto& completed_op = pending_ops[req_id];
+            // Record latency and completion
+            SimTime_t latency = getCurrentSimTime() - completed_op.start_time;
+            stat_total_latency->addData(latency);
+            stat_ops_completed->addData(1);
+            
+            // Remove from pending operations
+            pending_ops.erase(req_id);
+        }
+        return;
+    }
+    
+    // Handle initialization write completion
+    if (op.type == AsyncOperation::INIT_WRITE) {
+        out.output("Node %d: Root node write complete, setting validity_bit=1\n", node_id);
+        
+        // Step 3: Write validity_bit = 1 (tree is now ready)
+        std::vector<uint8_t> valid_bit = {1};
+        auto validity_req = new SST::Interfaces::StandardMem::Write(VALIDITY_BIT_ADDRESS, 1, valid_bit);
+        SST::Interfaces::StandardMem* validity_interface = get_interface_for_address(VALIDITY_BIT_ADDRESS);
+        validity_interface->send(validity_req);
+        
+        out.output("Node %d: B+tree initialization complete, validity_bit=1, tree ready\n", node_id);
+        tree_initialized = true;
+        pending_ops.erase(req_id);
+        return;
+    }
     
     if (op.waiting_for_write) {
         // Check if this is part of a split operation
@@ -317,17 +412,24 @@ void ComputeServer::handle_write_response(Interfaces::StandardMem::Request::id_t
             
             stat_inserts->addData(1);
             
-            // Release all locks held during operation
+            // Mark operation as ready to complete
+            op.ready_to_complete = true;
+            
+            // Release all locks held during operation (async with LL/SC)
             auto interface_getter = [this](uint64_t addr) { return get_interface_for_address(addr); };
-            lock_manager->release_all_locks(op, interface_getter);
+            lock_manager->release_all_locks(req_id, op, interface_getter, pending_ops);
             
-            // Record latency and completion
-            SimTime_t latency = getCurrentSimTime() - op.start_time;
-            stat_total_latency->addData(latency);
-            stat_ops_completed->addData(1);
-            
-            // Remove from pending operations
-            pending_ops.erase(req_id);
+            // Check if operation can complete immediately (no locks to release)
+            if (lock_manager->is_operation_complete(op)) {
+                // Record latency and completion
+                SimTime_t latency = getCurrentSimTime() - op.start_time;
+                stat_total_latency->addData(latency);
+                stat_ops_completed->addData(1);
+                
+                // Remove from pending operations
+                pending_ops.erase(req_id);
+            }
+            // Otherwise, operation will complete after locks are released
         }
     }
 }
@@ -373,10 +475,10 @@ void ComputeServer::handle_btree_traversal(
     op.current_level++;
     op.current_address = child_addr;
     
-    // Remove current request (btree_ops will create new one)
-    pending_ops.erase(req_id);
-    
     // Delegate back to btree_ops to continue the operation
+    // Note: btree_ops will call lock_manager->try_acquire_lock_async() which creates
+    // a NEW request with a NEW req_id and inserts it into pending_ops.
+    // We must erase the old req_id AFTER to avoid losing the operation if something fails.
     auto interface_getter = [this](uint64_t addr) { return get_interface_for_address(addr); };
     
     if (op.type == AsyncOperation::SEARCH) {
@@ -384,6 +486,9 @@ void ComputeServer::handle_btree_traversal(
     } else if (op.type == AsyncOperation::INSERT) {
         btree_ops->btree_insert_async(op.key, op.value, op, pending_ops, lock_manager, interface_getter, stat_network_reads);
     }
+    
+    // Remove old request ID now that new one has been created
+    pending_ops.erase(req_id);
 }
 
 void ComputeServer::handle_leaf_search(
@@ -404,17 +509,24 @@ void ComputeServer::handle_leaf_search(
     
     stat_searches->addData(1);
     
-    // Release all locks held during traversal
+    // Mark operation as ready to complete
+    op.ready_to_complete = true;
+    
+    // Release all locks held during traversal (async with LL/SC)
     auto interface_getter = [this](uint64_t addr) { return get_interface_for_address(addr); };
-    lock_manager->release_all_locks(op, interface_getter);
+    lock_manager->release_all_locks(req_id, op, interface_getter, pending_ops);
     
-    // Record latency and completion
-    SimTime_t latency = getCurrentSimTime() - op.start_time;
-    stat_total_latency->addData(latency);
-    stat_ops_completed->addData(1);
-    
-    // Operation complete - remove from pending
-    pending_ops.erase(req_id);
+    // Check if operation can complete immediately (no locks to release)
+    if (lock_manager->is_operation_complete(op)) {
+        // Record latency and completion
+        SimTime_t latency = getCurrentSimTime() - op.start_time;
+        stat_total_latency->addData(latency);
+        stat_ops_completed->addData(1);
+        
+        // Operation complete - remove from pending
+        pending_ops.erase(req_id);
+    }
+    // Otherwise, operation will complete after locks are released
 }
 
 void ComputeServer::handle_leaf_insert(
@@ -646,7 +758,7 @@ void ComputeServer::handle_root_split(
     // Write the new root
     auto data = serializer->serialize(new_root);
     auto write_req = new SST::Interfaces::StandardMem::Write(
-        new_root_address,
+        new_root_address + LOCK_HEADER_SIZE,  // Write after lock header
         data.size(),
         data
     );
@@ -679,9 +791,10 @@ void ComputeServer::write_parent_and_complete(
     // Serialize the modified parent
     auto data = serializer->serialize(parent);
     
+    // Create write request - write after lock header
     // Create write request
     auto write_req = new SST::Interfaces::StandardMem::Write(
-        parent.node_address,
+        parent.node_address + LOCK_HEADER_SIZE,
         data.size(),
         data
     );
@@ -785,7 +898,7 @@ void ComputeServer::write_split_nodes(
         // Phase 1: Write left leaf (old node)
         auto data = serializer->serialize(op.old_node);
         auto write_req = new SST::Interfaces::StandardMem::Write(
-            op.old_node.node_address, 
+            op.old_node.node_address + LOCK_HEADER_SIZE,  // Write after lock header
             data.size(), 
             data
         );
@@ -808,7 +921,7 @@ void ComputeServer::write_split_nodes(
         // Phase 2: Write right leaf (new sibling)
         auto data = serializer->serialize(op.new_node);
         auto write_req = new SST::Interfaces::StandardMem::Write(
-            op.new_node.node_address, 
+            op.new_node.node_address + LOCK_HEADER_SIZE,  // Write after lock header
             data.size(), 
             data
         );
@@ -885,9 +998,9 @@ void ComputeServer::write_leaf_and_complete(
     // Serialize the modified leaf
     auto data = serializer->serialize(leaf);
     
-    // Create write request
+    // Create write request - write at address + LOCK_HEADER_SIZE (after lock header)
     auto write_req = new SST::Interfaces::StandardMem::Write(
-        leaf.node_address, 
+        leaf.node_address + LOCK_HEADER_SIZE, 
         data.size(), 
         data
     );
@@ -925,19 +1038,72 @@ uint64_t ComputeServer::allocate_node_address(uint64_t node_id, uint32_t level) 
 }
 
 void ComputeServer::initialize_btree() {
+    // Only node_id 0 initializes the B+tree to avoid conflicts
+    if (node_id != 0) {
+        out.output("Node %d: Skipping tree initialization (only node 0 initializes), will check validity bit\n", node_id);
+        // Non-initializing nodes will check validity bit in tick()
+        return;
+    }
+    
+    out.output("Node %d: Initializing B+tree with validity bit synchronization\n", node_id);
+    
+    // Step 1: Write validity_bit = 0 (tree not ready)
+    std::vector<uint8_t> invalid_bit = {0};
+    auto validity_req1 = new SST::Interfaces::StandardMem::Write(VALIDITY_BIT_ADDRESS, 1, invalid_bit);
+    SST::Interfaces::StandardMem* validity_interface = get_interface_for_address(VALIDITY_BIT_ADDRESS);
+    validity_interface->send(validity_req1);
+    out.output("Node %d: Wrote validity_bit=0 (tree not ready)\n", node_id);
+    
+    // Step 2: Write the root node  
     BTreeNode root(btree_fanout);
     root.is_leaf = true;
     root.num_keys = 0;
     root.node_address = root_address;
     
     auto data = serializer->serialize(root);
-    auto req = new SST::Interfaces::StandardMem::Write(root_address, data.size(), data);
+    
+    // IMPORTANT: The lock system reads node data from address + LOCK_HEADER_SIZE (after lock header)
+    // So we must write the node data at root_address + LOCK_HEADER_SIZE
+    // The first LOCK_HEADER_SIZE bytes (lock header) are initialized to zero by the memory server
+    auto root_req = new SST::Interfaces::StandardMem::Write(root_address + LOCK_HEADER_SIZE, data.size(), data);
+    
+    // Track this write request so we know when initialization completes
+    AsyncOperation init_op;
+    init_op.type = AsyncOperation::INIT_WRITE;
+    init_op.waiting_for_write = false;
+    pending_ops[root_req->getID()] = init_op;
     
     SST::Interfaces::StandardMem* target_interface = get_interface_for_address(root_address);
-    target_interface->send(req);
+    target_interface->send(root_req);
+    
+    out.output("Node %d: Wrote root node at address 0x%lx\n", node_id, root_address);
+    
+    // Step 3: Write validity_bit = 1 (tree ready) - this will be done in handle_write_response
+    // when we get confirmation that the root node write completed
 }
 
-
+void ComputeServer::check_tree_initialization() {
+    // Non-initializing nodes check the validity bit to see if Node 0 has completed initialization
+    if (checking_validity_bit) {
+        // Already waiting for a read response
+        return;
+    }
+    
+    out.output("Node %d: Checking validity bit at address 0x%llx\n", node_id, VALIDITY_BIT_ADDRESS);
+    
+    // Read the validity bit
+    auto req = new SST::Interfaces::StandardMem::Read(VALIDITY_BIT_ADDRESS, 1);
+    
+    AsyncOperation check_op;
+    check_op.type = AsyncOperation::VALIDITY_CHECK;
+    check_op.waiting_for_write = false;
+    pending_ops[req->getID()] = check_op;
+    
+    SST::Interfaces::StandardMem* validity_interface = get_interface_for_address(VALIDITY_BIT_ADDRESS);
+    validity_interface->send(req);
+    
+    checking_validity_bit = true;
+}
 
 void ComputeServer::process_btree_operation(const WorkloadOp& op) {
     if (op.op_type == BTREE_SEARCH) {

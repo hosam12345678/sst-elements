@@ -83,7 +83,9 @@ struct AsyncOperation {
         SEARCH,           // Searching for a key
         SPLIT_LEAF,       // Splitting a leaf node
         SPLIT_INTERNAL,   // Splitting an internal node
-        UPDATE_PARENT     // Updating parent after split
+        UPDATE_PARENT,    // Updating parent after split
+        INIT_WRITE,       // Initial tree write (for tracking completion)
+        VALIDITY_CHECK    // Checking validity bit for initialization synchronization
     };
     
     // Split operation phases
@@ -114,21 +116,41 @@ struct AsyncOperation {
     
     // Lock tracking for distributed locking protocol
     std::vector<uint64_t> held_locks;   // Addresses of nodes we currently hold locks on
+    std::vector<bool> held_locks_exclusive; // true = exclusive lock, false = shared lock
     bool waiting_for_lock;              // Are we waiting to retry lock acquisition?
     uint64_t lock_target_address;       // Address we're trying to lock
+    
+    // LL/SC fields for atomic lock acquisition
+    bool waiting_for_loadlink_response; // Waiting for LoadLink response (lock read)
+    bool waiting_for_sc_response;       // Waiting for StoreConditional response (lock write)
+    uint32_t llsc_retry_count;          // Number of LL/SC retry attempts
+    uint64_t llsc_lock_value;           // Lock value read from LoadLink
+    
+    // LL/SC fields for atomic lock release
+    bool waiting_for_release_ll;        // Waiting for LoadLink during release
+    bool waiting_for_release_sc;        // Waiting for StoreConditional during release
+    uint32_t release_lock_index;        // Index in held_locks[] currently being released
+    uint64_t release_lock_value;        // Lock value from LoadLink during release
     
     // Write tracking
     bool waiting_for_write;             // Are we waiting for a write to complete?
     bool need_exclusive_lock;           // true = exclusive lock, false = shared lock
-    uint32_t lock_retry_count;          // How many times we've retried
+    uint32_t lock_retry_count;          // [DEPRECATED] Legacy retry count
+    
+    // Operation completion tracking
+    bool ready_to_complete;             // Operation logic done, waiting for lock release
     
     // Constructor
     AsyncOperation() : type(TRAVERSAL), key(0), value(0), current_level(0), 
                       current_address(0), start_time(0), split_phase(NONE),
                       separator_key(0), parent_address(0), is_root_split(false),
-                      waiting_for_lock(false), lock_target_address(0), 
-                      waiting_for_write(false),
-                      need_exclusive_lock(false), lock_retry_count(0) {}
+                      waiting_for_lock(false), lock_target_address(0),
+                      waiting_for_loadlink_response(false), waiting_for_sc_response(false),
+                      llsc_retry_count(0), llsc_lock_value(0),
+                      waiting_for_release_ll(false), waiting_for_release_sc(false),
+                      release_lock_index(0), release_lock_value(0),
+                      waiting_for_write(false), need_exclusive_lock(false), lock_retry_count(0),
+                      ready_to_complete(false) {}
 };
 
 } // namespace MemHierarchy

@@ -136,6 +136,8 @@ public:
     // Remote memory request handlers
     void handle_remote_read(SST::Interfaces::StandardMem::Read* req, int interface_id);
     void handle_remote_write(SST::Interfaces::StandardMem::Write* req, int interface_id);
+    void handle_loadlink(SST::Interfaces::StandardMem::LoadLink* req, int interface_id);
+    void handle_storeconditional(SST::Interfaces::StandardMem::StoreConditional* req, int interface_id);
 
     // ===== IN-MEMORY LOCK OPERATIONS =====
     // Shared lock operations (for SEARCH/reads)
@@ -182,6 +184,13 @@ private:
     uint64_t total_locks_acquired;   // Statistics
     uint64_t total_locks_released;
     uint64_t total_lock_conflicts;   // Times lock acquisition failed (already held)
+    
+    // ===== LOAD-LINK/STORE-CONDITIONAL TRACKING =====
+    // Track LoadLink reservations for atomic operations
+    // Maps address -> map of (interface_id -> reservation_value)
+    // Multiple nodes can have LL reservations on the same address
+    // Any write to an address invalidates ALL reservations except the writer's
+    std::unordered_map<uint64_t, std::unordered_map<int, uint64_t>> ll_reservations;
     
     // Memory interfaces (multiple for accepting connections from different compute servers)
     SST::Interfaces::StandardMem* mem_interface;  // Primary interface

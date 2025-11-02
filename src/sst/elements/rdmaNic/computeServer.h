@@ -113,6 +113,8 @@ private:
     // Workload state
     std::queue<WorkloadOp> pending_operations;
     WorkloadGenerator* workload_gen;  // Handles workload generation
+    bool tree_initialized;  // Tracks if B+tree initialization is complete
+    bool checking_validity_bit;  // Tracks if we're waiting for validity bit check
 
     // B+tree state
     uint64_t root_address;
@@ -155,13 +157,15 @@ private:
     
     // B+tree structure management
     void initialize_btree();
+    void check_tree_initialization();  // Check validity bit before starting operations
     uint64_t calculate_tree_height(uint64_t num_keys);
     uint64_t get_child_index_for_key(const BTreeNode& node, uint64_t key);
     
     // Async operation handlers
     void handle_read_response(SST::Interfaces::StandardMem::Request::id_t req_id, 
                              const std::vector<uint8_t>& data);
-    void handle_write_response(SST::Interfaces::StandardMem::Request::id_t req_id);
+    void handle_write_response(SST::Interfaces::StandardMem::Request::id_t req_id,
+                               SST::Interfaces::StandardMem::WriteResp* resp);
     void handle_leaf_operation(AsyncOperation& op, BTreeNode& leaf);
     
     // B+tree traversal helpers

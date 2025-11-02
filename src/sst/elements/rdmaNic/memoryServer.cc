@@ -164,10 +164,16 @@ void MemoryServer::handleMemoryEventFromInterface(SST::Interfaces::StandardMem::
               interface_id, req->getString().c_str(), req->getID());
     
     // Handle incoming remote memory requests with interface ID for proper response routing
-    if (auto read_req = dynamic_cast<SST::Interfaces::StandardMem::Read*>(req)) {
+    if (auto ll_req = dynamic_cast<SST::Interfaces::StandardMem::LoadLink*>(req)) {
+        handle_loadlink(ll_req, interface_id);
+    } else if (auto sc_req = dynamic_cast<SST::Interfaces::StandardMem::StoreConditional*>(req)) {
+        handle_storeconditional(sc_req, interface_id);
+    } else if (auto read_req = dynamic_cast<SST::Interfaces::StandardMem::Read*>(req)) {
         handle_remote_read(read_req, interface_id);
     } else if (auto write_req = dynamic_cast<SST::Interfaces::StandardMem::Write*>(req)) {
         handle_remote_write(write_req, interface_id);
+    } else {
+        out.output("⚠️  Memory %d: Unhandled request type: %s\n", memory_server_id, req->getString().c_str());
     }
 }
 
@@ -250,6 +256,14 @@ void MemoryServer::handle_remote_write(SST::Interfaces::StandardMem::Write* req,
     // Regular memory write
     write_memory(address, data);
     
+    // CRITICAL: Invalidate any LL reservations for this address
+    // Any write (not just SC) must clear LL reservations to maintain atomicity
+    auto ll_it = ll_reservations.find(address);
+    if (ll_it != ll_reservations.end()) {
+        dbg.debug(CALL_INFO, 2, 0, "Regular Write invalidated LL reservation at 0x%lx\n", address);
+        ll_reservations.erase(ll_it);
+    }
+    
     // Send write response through the CORRECT interface
     auto resp = new SST::Interfaces::StandardMem::WriteResp(req);
     
@@ -265,6 +279,172 @@ void MemoryServer::handle_remote_write(SST::Interfaces::StandardMem::Write* req,
     }
     
     // Send response through the correct interface
+    response_interface->send(resp);
+}
+
+void MemoryServer::handle_loadlink(SST::Interfaces::StandardMem::LoadLink* req, int interface_id) {
+    uint64_t address = req->pAddr;
+    size_t size = req->size;
+    
+    dbg.debug(CALL_INFO, 2, 0, "LOADLINK: addr=0x%lx, size=%zu from interface %d\n", address, size, interface_id);
+    
+    out.output("🔗 Memory %d ← Compute: LOADLINK from address 0x%lx (size=%zu bytes) [LL/SC Protocol]\n", 
+               memory_server_id, address, size);
+    
+    stat_network_reads->addData(1);
+    
+    if (!is_address_in_range(address)) {
+        out.output("WARNING: Memory Server %d - LoadLink to invalid address 0x%lx\n", 
+                   memory_server_id, address);
+        send_response(req, false, interface_id);
+        return;
+    }
+    
+    // Read current value from memory
+    std::vector<uint8_t> data = read_memory(address, size);
+    
+    // Store reservation: track this address and the value read
+    // This allows StoreConditional to detect if the value changed
+    uint64_t value = 0;
+    if (data.size() >= 8) {
+        memcpy(&value, data.data(), 8);
+    }
+    
+    // Store LL reservation (allows multiple nodes to have reservations on same address)
+    // Each interface gets its own reservation tracking the value it read
+    ll_reservations[address][interface_id] = value;
+    
+    dbg.debug(CALL_INFO, 2, 0, "LL reservation set: addr=0x%lx, value=%lu, interface=%d (total reservations at this addr: %zu)\n", 
+              address, value, interface_id, ll_reservations[address].size());
+    
+    // Send ReadResp (LoadLink responds like Read, but use full constructor since LoadLink != Read)
+    auto resp = new SST::Interfaces::StandardMem::ReadResp(
+        req->getID(),           // Request ID
+        req->pAddr,             // Physical address
+        req->size,              // Size
+        data,                   // Response data
+        req->getAllFlags(),     // Flags
+        req->vAddr,             // Virtual address
+        req->iPtr,              // Instruction pointer
+        req->tid                // Thread ID
+    );
+    
+    SST::Interfaces::StandardMem* response_interface = nullptr;
+    if (interface_id >= 0 && interface_id < (int)all_mem_interfaces.size()) {
+        response_interface = all_mem_interfaces[interface_id];
+    } else {
+        response_interface = mem_interface;
+    }
+    
+    response_interface->send(resp);
+}
+
+void MemoryServer::handle_storeconditional(SST::Interfaces::StandardMem::StoreConditional* req, int interface_id) {
+    uint64_t address = req->pAddr;
+    const std::vector<uint8_t>& data = req->data;
+    
+    dbg.debug(CALL_INFO, 2, 0, "STORECONDITIONAL: addr=0x%lx, size=%zu from interface %d\n", 
+              address, data.size(), interface_id);
+    
+    out.output("🔐 Memory %d ← Compute: STORECONDITIONAL to address 0x%lx (size=%zu bytes) [LL/SC Protocol]\n", 
+               memory_server_id, address, data.size());
+    
+    stat_network_writes->addData(1);
+    
+    if (!is_address_in_range(address)) {
+        out.output("WARNING: Memory Server %d - StoreConditional to invalid address 0x%lx\n", 
+                   memory_server_id, address);
+        send_response(req, false, interface_id);
+        return;
+    }
+    
+    // Check if there's a valid LL reservation for this interface at this address
+    auto addr_it = ll_reservations.find(address);
+    bool sc_success = false;
+    
+    if (addr_it != ll_reservations.end()) {
+        // There are reservations at this address, check if this interface has one
+        auto& reservations_at_addr = addr_it->second;
+        auto res_it = reservations_at_addr.find(interface_id);
+        
+        if (res_it != reservations_at_addr.end()) {
+            // This interface has an LL reservation - check if value changed
+            uint64_t reserved_value = res_it->second;
+            
+            std::vector<uint8_t> current_data = read_memory(address, 8);
+            uint64_t current_value = 0;
+            if (current_data.size() >= 8) {
+                memcpy(&current_value, current_data.data(), 8);
+            }
+            
+            if (current_value == reserved_value) {
+                // Value hasn't changed - SC SUCCEEDS!
+                // This is the FIRST StoreConditional to execute successfully
+                write_memory(address, data);
+                sc_success = true;
+                
+                dbg.debug(CALL_INFO, 2, 0, "SC SUCCESS: addr=0x%lx, value unchanged (%lu), invalidating %zu other reservations\n", 
+                          address, current_value, reservations_at_addr.size() - 1);
+                out.output("   ✓ SC SUCCESS at 0x%lx (value unchanged: %lu) - invalidating %zu other reservations\n", 
+                          address, current_value, reservations_at_addr.size() - 1);
+                
+                // CRITICAL: Invalidate ALL reservations at this address (including ours)
+                // Any subsequent SC from other nodes will fail because:
+                // 1. Their reservation is gone, OR
+                // 2. The value changed from what they read
+                ll_reservations.erase(addr_it);
+                
+            } else {
+                // Value changed since our LL - SC FAILS!
+                // Another node already wrote to this address
+                sc_success = false;
+                
+                dbg.debug(CALL_INFO, 2, 0, "SC FAILED: addr=0x%lx, value changed (%lu -> %lu)\n", 
+                          address, reserved_value, current_value);
+                out.output("   ✗ SC FAILED at 0x%lx (value changed: %lu -> %lu) [RACE DETECTED!]\n", 
+                          address, reserved_value, current_value);
+                
+                // Remove only this interface's reservation (value already changed)
+                reservations_at_addr.erase(res_it);
+                if (reservations_at_addr.empty()) {
+                    ll_reservations.erase(addr_it);
+                }
+            }
+            
+        } else {
+            // This interface has no reservation at this address - SC FAILS
+            sc_success = false;
+            dbg.debug(CALL_INFO, 2, 0, "SC FAILED: addr=0x%lx, no LL reservation for interface %d\n", address, interface_id);
+            out.output("   ✗ SC FAILED at 0x%lx (no LL reservation for this interface)\n", address);
+        }
+    } else {
+        // No reservations at this address at all - SC FAILS
+        sc_success = false;
+        dbg.debug(CALL_INFO, 2, 0, "SC FAILED: addr=0x%lx, no LL reservations at this address\n", address);
+        out.output("   ✗ SC FAILED at 0x%lx (no LL reservations at this address)\n", address);
+    }
+    
+    // Send WriteResp with success/failure flag (use full constructor since StoreConditional != Write)
+    auto resp = new SST::Interfaces::StandardMem::WriteResp(
+        req->getID(),           // Request ID
+        req->pAddr,             // Physical address
+        req->size,              // Size
+        req->getAllFlags(),     // Flags
+        req->vAddr,             // Virtual address
+        req->iPtr,              // Instruction pointer
+        req->tid                // Thread ID
+    );
+    if (!sc_success) {
+        resp->setFail();  // Set fail flag if SC failed
+    }
+    
+    SST::Interfaces::StandardMem* response_interface = nullptr;
+    if (interface_id >= 0 && interface_id < (int)all_mem_interfaces.size()) {
+        response_interface = all_mem_interfaces[interface_id];
+    } else {
+        response_interface = mem_interface;
+    }
+    
     response_interface->send(resp);
 }
 

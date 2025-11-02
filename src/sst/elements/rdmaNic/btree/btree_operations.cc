@@ -32,20 +32,18 @@ void BTreeOperations::btree_insert_async(
         out_->output("\n🔹 INSERT Operation (async): key=%lu, value=%lu\n", key, value);
     }
     
-    // Setup operation
-    op.type = AsyncOperation::INSERT;
-    op.key = key;
-    op.value = value;
-    op.current_level = 0;
-    op.current_address = root_address_;
+    // Don't modify op.current_level or op.current_address here
+    // They are set by the caller (ComputeServer::btree_insert_async for new ops,
+    // or handle_btree_traversal for continuation)
     
-    // Acquire EXCLUSIVE lock on root node (INSERT requires write access)
+    // Acquire EXCLUSIVE lock on the current node (INSERT requires write access)
     if (out_) {
-        out_->output("   Step 1: Acquiring EXCLUSIVE lock on root=0x%lx\n", root_address_);
+        out_->output("   Step 1: Acquiring EXCLUSIVE lock on node=0x%lx (level=%u)\n", 
+                    op.current_address, op.current_level);
     }
     
-    SST::Interfaces::StandardMem* interface = interface_getter(root_address_);
-    lock_manager->try_acquire_lock_async(op, root_address_, true, interface, pending_ops);
+    SST::Interfaces::StandardMem* interface = interface_getter(op.current_address);
+    lock_manager->try_acquire_lock_async(op, op.current_address, true, interface, pending_ops);
     stat_reads->addData(1);
 }
 
@@ -61,19 +59,18 @@ void BTreeOperations::btree_search_async(
         out_->output("\n🔍 SEARCH Operation (async): key=%lu\n", key);
     }
     
-    // Setup operation
-    op.type = AsyncOperation::SEARCH;
-    op.key = key;
-    op.current_level = 0;
-    op.current_address = root_address_;
+    // Don't modify op.current_level or op.current_address here
+    // They are set by the caller (ComputeServer::btree_search_async for new ops,
+    // or handle_btree_traversal for continuation)
     
-    // Acquire SHARED lock on root node (SEARCH only needs read access)
+    // Acquire SHARED lock on the current node (SEARCH only needs read access)
     if (out_) {
-        out_->output("   Step 1: Acquiring SHARED lock on root=0x%lx\n", root_address_);
+        out_->output("   Step 1: Acquiring SHARED lock on node=0x%lx (level=%u)\n", 
+                    op.current_address, op.current_level);
     }
     
-    SST::Interfaces::StandardMem* interface = interface_getter(root_address_);
-    lock_manager->try_acquire_lock_async(op, root_address_, false, interface, pending_ops);
+    SST::Interfaces::StandardMem* interface = interface_getter(op.current_address);
+    lock_manager->try_acquire_lock_async(op, op.current_address, false, interface, pending_ops);
     stat_reads->addData(1);
 }
 
