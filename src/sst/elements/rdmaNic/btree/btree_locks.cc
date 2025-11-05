@@ -395,6 +395,7 @@ void BTreeLockManager::handle_release_loadlink_response(
             if (out_) {
                 out_->fatal(CALL_INFO, -1, "ERROR: Attempting to release shared lock 0x%lx but it's already free!\n",
                            lock_addr);
+                assert(0);
             }
         } else if (lock_state & 0x8000000000000000ULL) {
             if (out_) {
@@ -483,8 +484,9 @@ void BTreeLockManager::handle_release_storeconditional_response(
         // More locks to release
         op.waiting_for_release_ll = true;
         auto old_req_id = it->first;
-        pending_ops.erase(it);  // Remove current request ID
-        release_single_lock_async(0, op, interface_getter, pending_ops);
+        AsyncOperation next_op = op;  // Copy before erase!
+        pending_ops.erase(it);  // Remove current request ID (invalidates 'op' reference)
+        release_single_lock_async(0, next_op, interface_getter, pending_ops);
     } else {
         // All locks released! Operation can now complete
         if (verbose_level_ >= 2 && out_) {

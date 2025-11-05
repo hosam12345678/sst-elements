@@ -121,6 +121,23 @@ private:
     uint32_t tree_height;                        // Current height of the tree
     uint64_t next_node_id;                       // Counter for allocating node IDs
     std::map<uint64_t, uint64_t> parent_map;     // Maps child_address → parent_address (for split operations)
+    
+    // Chunk allocation tracking (per memory server)
+    struct ChunkInfo {
+        uint32_t chunk_id;          // Chunk ID from memory server
+        uint64_t chunk_address;     // Base address of this chunk
+        uint32_t nodes_used;        // Number of nodes allocated from this chunk
+        
+        ChunkInfo() : chunk_id(0), chunk_address(0), nodes_used(0) {}
+        ChunkInfo(uint32_t id, uint64_t addr) : chunk_id(id), chunk_address(addr), nodes_used(0) {}
+    };
+    
+    // Store all allocated chunks per memory server
+    // Key: memory_server_id, Value: vector of chunks (in allocation order)
+    std::map<uint32_t, std::vector<ChunkInfo>> allocated_chunks;
+    
+    // Round-robin memory server selection
+    uint32_t current_memory_server;  // Next memory server to allocate from
 
     // Network interfaces (multiple for connecting to different memory servers)
     SST::Interfaces::StandardMem* memory_interface;  // Primary interface
@@ -151,10 +168,27 @@ private:
     SimTime_t last_op_time;
     
     // Helper functions
-    uint64_t allocate_node_address(uint64_t node_id, uint32_t level);
+    uint64_t allocate_node_address();  // Allocate node address using round-robin chunk allocation
     SST::Interfaces::StandardMem* get_interface_for_address(uint64_t address);
     void process_btree_operation(const WorkloadOp& op);
     
+    // ===== CHUNK ALLOCATION VIA MAGIC ADDRESS =====
+    // Magic address for chunk allocation requests (matches MemoryServer constant)
+    static constexpr uint64_t MAGIC_ALLOCATE_CHUNK_BASE = 0xFFFFFFFF00000000ULL;
+    
+    // Request chunk allocation from a specific memory server
+    // Uses READ operation to magic address: (MAGIC_ALLOCATE_CHUNK_BASE | memory_server_id)
+    // Response: ReadResp with [chunk_id (4 bytes)] [chunk_address (8 bytes)]
+    //           or chunk_id=0xFFFFFFFF if allocation failed
+    void request_chunk_allocation(uint32_t memory_server_id);
+    
+    // Handle chunk allocation response
+    void handle_chunk_allocation_response(SST::Interfaces::StandardMem::Request::id_t req_id,
+                                         SST::Interfaces::StandardMem::ReadResp* resp);
+    
+    // Check if a request is a special operation (chunk allocation, etc.)
+    bool handle_special_operation_response(SST::Interfaces::StandardMem::Request* req);
+  
     // B+tree structure management
     void initialize_btree();
     void check_tree_initialization();  // Check validity bit before starting operations

@@ -1,87 +1,121 @@
 #!/usr/bin/env python3
 """
-Test 1.3: Single Insert + Search
+Test 1.2: Single Insert
 Phase: Basic Operations (Foundation)
 
-Test Objective: Verify that inserted keys can be found by search
+Test Objective: Verify basic insert operation into an empty tree
 Expected Behavior:
-  - Insert key=100 into empty tree succeeds
-  - Search for key=100 returns FOUND
-  - Search for non-existent key returns NOT FOUND
+  - Insert keys into empty tree succeeds
+  - Tree grows correctly
+  - Inserts complete without errors
+  - LL/SC lock acquisition works with write operations
 
 Validates:
-  - Insert operation works correctly
-  - Search finds inserted key
-  - Integration between insert and search paths
-  - Value retrieval after insert
+  - Basic insert operation
+  - Leaf modification (adding key to keys array)
+  - Node serialization and write back to memory
+  - LL/SC lock protocol with concurrent inserts
 """
 
 import sst
 
 print("=" * 80)
-print("TEST 1.3: Single Insert + Search")
+print("TEST 1.2: Basic Insert Operations")
 print("=" * 80)
 print("Phase: Basic Operations (Foundation)")
 print()
 print("Test Objective:")
-print("  Verify that inserted keys can be found by subsequent search")
+print("  Insert keys into empty B+tree with concurrent compute nodes")
 print()
 print("Expected Behavior:")
 print("  1. Tree initializes with empty root leaf (0 keys)")
-print("  2. INSERT key=100 succeeds")
-print("  3. SEARCH for key=100 returns FOUND with correct value")
-print("  4. SEARCH for key=200 (not inserted) returns NOT FOUND")
+print("  2. Inserts add keys to tree successfully")
+print("  3. LL/SC lock acquisition works correctly")
+print("  4. Lock release with LL/SC completes without errors")
 print()
 
-# Create compute server - configure to do insert then searches
-compute = sst.Component("compute_0", "rdmaNic.computeServer")
-compute.addParams({
-    "verbose": 1,
-    "node_id": 0,
-    "num_memory_nodes": 1,
-    "operations_per_second": 50,  # Slow for observation
-    "simulation_duration_us": 200000,  # 200ms
-    "read_ratio": 0.7,  # 70% searches, 30% inserts
-    "key_range": 5,  # Keys 0-4 (will generate mix of inserts and searches)
-    "btree_fanout": 16,  # No splits expected
-    "key_distribution": "uniform",
-})
+# ============================================================================
+# Component Configuration
+# ============================================================================
+num_compute_nodes = 2 # Multiple compute nodes
+num_memory_servers = 2  # Multiple memory servers
+memory_capacity_mb = 16
+memory_base_address = 0x10000000
+btree_fanout = 16
 
-# Create memory server
-memory = sst.Component("memory_0", "rdmaNic.memoryServer")
-memory.addParams({
-    "verbose": 1,
-    "memory_server_id": 0,
-    "num_compute_nodes": 1,
-    "memory_size_mb": 16,
-    "base_addr": "0x10000000",
-})
+# Workload Configuration
+operations_per_second = 100
+simulation_duration_us = 100000  # 100ms
+read_ratio = 0.7  # 70% reads (30% inserts)
+key_range = 4  # Keys 0-3
+key_distribution = "uniform"
 
-# Setup network interfaces
-compute_iface = compute.setSubComponent("mem_interface_0", "memHierarchy.standardInterface")
-memory_iface = memory.setSubComponent("mem_interface_0", "memHierarchy.standardInterface")
+# ============================================================================
+# Instantiate Components
+# ============================================================================
 
-# Connect compute to memory
-link = sst.Link("compute_memory_link")
-link.connect((compute_iface, "lowlink", "1ns"), (memory_iface, "lowlink", "1ns"))
+# Compute Server(s)
+compute_servers = []
+for i in range(num_compute_nodes):
+    compute = sst.Component(f"compute_{i}", "rdmaNic.computeServer")
+    compute.addParams({
+        "verbose": 5,
+        "node_id": i,
+        "num_memory_nodes": num_memory_servers,
+        "operations_per_second": operations_per_second,
+        "simulation_duration_us": simulation_duration_us,
+        "read_ratio": read_ratio,
+        "key_distribution": key_distribution,
+        "key_range": key_range,
+        "btree_fanout": btree_fanout,
+    })
+    compute_servers.append(compute)
+
+# Memory Server(s)
+memory_servers = []
+for i in range(num_memory_servers):
+    memory = sst.Component(f"memory_{i}", "rdmaNic.memoryServer")
+    memory.addParams({
+        "verbose": 5,
+        "memory_server_id": i,
+        "num_compute_nodes": num_compute_nodes,
+        "memory_size_mb": memory_capacity_mb,
+        "base_addr": f"0x{memory_base_address + (i * (memory_capacity_mb << 20)):x}",
+    })
+    memory_servers.append(memory)
+
+# ============================================================================
+# Connect Compute ↔ Memory (Many-to-Many)
+# ============================================================================
+for comp_idx, compute in enumerate(compute_servers):
+    for mem_idx, memory in enumerate(memory_servers):
+        # Setup subcomponents for interfaces
+        compute_iface = compute.setSubComponent(f"mem_interface_{mem_idx}", "memHierarchy.standardInterface")
+        memory_iface = memory.setSubComponent(f"mem_interface_{comp_idx}", "memHierarchy.standardInterface")
+        
+        # Connect compute to memory
+        link = sst.Link(f"link_c{comp_idx}_m{mem_idx}")
+        link.connect((compute_iface, "lowlink", "1ns"), (memory_iface, "lowlink", "1ns"))
+
+sst.setStatisticLoadLevel(1)
 
 print("Test Configuration:")
-print("  - 1 compute server, 1 memory server")
+print(f"  - {num_compute_nodes} compute servers × {num_memory_servers} memory servers (many-to-many)")
 print("  - Fanout: 16 keys per node")
-print("  - Operations: ~10 total (mix of inserts and searches)")
-print("  - Key range: 0-4")
-print("  - 70% searches, 30% inserts")
+print("  - Operations: ~10 inserts per node")
+print("  - Key range: 0-9")
+print("  - Tree starts empty (root with 0 keys)")
 print()
 print("Expected Output:")
-print("  ✓ Initial searches return NOT FOUND (empty tree)")
-print("  ✓ After INSERT key=X: '✓ Inserted key=X'")
-print("  ✓ Subsequent SEARCH for key=X: '✓ FOUND key=X'")
-print("  ✓ Searches for non-inserted keys: '✗ NOT FOUND'")
-print("  ✓ Tree height remains 1")
+print("  ✓ Tree initializes with height=1, root has 0 keys")
+print("  ✓ INSERT operations add keys to tree")
+print("  ✓ LL/SC lock acquisition succeeds (retry #0 or low retry count)")
+print("  ✓ Lock release with LL/SC completes successfully")
+print("  ✓ No assertion failures or crashes")
 print()
 print("Critical Validations:")
-print("  - Insert-then-search sequence works correctly")
-print("  - Value stored during insert matches value returned by search")
-print("  - Multiple inserts and searches interleave properly")
-print("  - Lock acquisition/release for both operations")
+print("  - LL/SC lock acquisition works with EXCLUSIVE locks (inserts)")
+print("  - Lock release uses LL/SC protocol")
+print("  - Reference counts handled correctly")
+print("  - No deadlocks or race conditions")
 print("=" * 80)

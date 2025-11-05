@@ -11,6 +11,7 @@
 
 #include <sst_config.h>
 #include "computeServer.h"
+#include "memoryServer.h"  // For CHUNK_SIZE constant
 #include "workload/workload_generator.h"
 #include <cassert>
 
@@ -30,6 +31,9 @@ using namespace SST::MemHierarchy;
 // Lock header size - reserved space before node data
 // The lock system uses this space for lock metadata (currently unimplemented)
 #define LOCK_HEADER_SIZE 8
+
+// Maximum serialized node size (in bytes)
+#define NODE_MAX_SIZE 512
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONSTRUCTOR
@@ -57,12 +61,43 @@ ComputeServer::ComputeServer(ComponentId_t id, Params& params) :
         zipfian_alpha = 0.0;  // Force uniform distribution
     }
 
+    // Validate fanout against maximum node size
+    // BTreeNode size (worst case - internal node):
+    // = 21 bytes (header: num_keys=4, is_leaf=1, node_address=8, next_leaf=8)
+    // + (fanout-1) * 8 bytes (keys array)
+    // + fanout * 8 bytes (children array for internal nodes)
+    // = 21 + 8*(fanout-1) + 8*fanout = 21 + 16*fanout - 8 = 13 + 16*fanout
+    const uint64_t NODE_HEADER_SIZE = 21;
+    const uint64_t BYTES_PER_KEY = 8;
+    const uint64_t BYTES_PER_CHILD = 8;
+    uint64_t max_internal_node_size = NODE_HEADER_SIZE + 
+                                       (btree_fanout - 1) * BYTES_PER_KEY + 
+                                       btree_fanout * BYTES_PER_CHILD;
+    
+    if (max_internal_node_size > NODE_MAX_SIZE) {
+        uint32_t max_supported_fanout = (NODE_MAX_SIZE - 13) / 16;
+        out.fatal(CALL_INFO, -1, 
+                  "Fanout %u is too large! Max internal node size would be %lu bytes (limit: %u bytes)\n"
+                  "Maximum supported fanout = (%u - 13) / 16 = %u\n",
+                  btree_fanout, max_internal_node_size, NODE_MAX_SIZE, 
+                  NODE_MAX_SIZE, max_supported_fanout);
+    }
+    
+    if (verbose_level >= 1) {
+        out.output("B+tree fanout validated: %u (max node size: %lu bytes)\n", 
+                   btree_fanout, max_internal_node_size);
+    }
+    
     // Initialize B+tree state
     tree_height = 1;
     next_node_id = 0;
     root_address = MEMORY_BASE_ADDRESS;  // Root at base address, validity bit is separate
     tree_initialized = false;  // Will be set true after validity bit check passes
     checking_validity_bit = false;  // Will be set true when checking validity
+    
+    // Initialize round-robin memory server selection
+    // Start with server based on compute node_id to distribute initial load
+    current_memory_server = node_id % num_memory_nodes;
 
     // Setup debug output
     dbg.init("", 5, 0, (Output::output_location_t)1);
@@ -156,6 +191,15 @@ void ComputeServer::setup() {
         interface->setup();
     }
     
+    // Request initial chunk from the current memory server
+    // This ensures we have at least one chunk available before starting operations
+    if (verbose_level >= 1) {
+        out.output("\n=== Chunk Allocation Setup ===\n");
+        out.output("Compute %d: Requesting initial chunk from memory server %u (round-robin start)\n",
+                   node_id, current_memory_server);
+    }
+    request_chunk_allocation(current_memory_server);
+    
     // Initialize B+tree after address routing is established
     initialize_btree();
 }
@@ -174,6 +218,14 @@ void ComputeServer::finish() {
 }
 
 bool ComputeServer::tick(Cycle_t current_cycle) {
+    // Wait for initial chunk allocation to complete before starting operations
+    // This ensures we have memory available before initializing the tree
+    if (allocated_chunks.find(current_memory_server) == allocated_chunks.end() ||
+        allocated_chunks[current_memory_server].empty()) {
+        // Initial chunk not ready yet - keep waiting
+        return false;
+    }
+    
     // Wait for tree initialization to complete before starting operations
     if (!tree_initialized) {
         // Non-initializing nodes need to check the validity bit
@@ -210,6 +262,13 @@ bool ComputeServer::tick(Cycle_t current_cycle) {
 void ComputeServer::handleMemoryEvent(Interfaces::StandardMem::Request* req) {
     auto req_id = req->getID();
     
+    // Check if this is a special operation (chunk allocation, etc.)
+    if (handle_special_operation_response(req)) {
+        delete req;
+        return;
+    }
+    
+    // Handle regular read/write responses
     if (auto* read_resp = dynamic_cast<Interfaces::StandardMem::ReadResp*>(req)) {
         handle_read_response(req_id, read_resp->data);
     } else if (auto* write_resp = dynamic_cast<Interfaces::StandardMem::WriteResp*>(req)) {
@@ -217,6 +276,39 @@ void ComputeServer::handleMemoryEvent(Interfaces::StandardMem::Request* req) {
     }
     
     delete req;
+}
+
+bool ComputeServer::handle_special_operation_response(Interfaces::StandardMem::Request* req) {
+    auto req_id = req->getID();
+    
+    // Check if this is a response to one of our pending operations
+    auto op_it = pending_ops.find(req_id);
+    if (op_it == pending_ops.end()) {
+        return false;  // Not a pending operation
+    }
+    
+    AsyncOperation& op = op_it->second;
+    
+    // Check operation type and handle accordingly
+    switch (op.type) {
+        case AsyncOperation::CHUNK_ALLOCATE:
+            if (auto* read_resp = dynamic_cast<Interfaces::StandardMem::ReadResp*>(req)) {
+                handle_chunk_allocation_response(req_id, read_resp);
+                return true;  // Handled
+            }
+            break;
+            
+        // Add more special operation types here in the future
+        // case AsyncOperation::SOME_OTHER_SPECIAL_OP:
+        //     handle_other_special_op(req_id, req);
+        //     return true;
+        
+        default:
+            // Not a special operation, let normal handlers process it
+            return false;
+    }
+    
+    return false;  // Not handled as special operation
 }
 
 void ComputeServer::btree_search_async(uint64_t key) {
@@ -683,7 +775,8 @@ void ComputeServer::handle_internal_split(
     }
     
     // Create right sibling internal node
-    uint64_t right_internal_address = allocate_node_address(next_node_id++, op.current_level - 1);
+    next_node_id++;  // Increment node counter
+    uint64_t right_internal_address = allocate_node_address();
     BTreeNode right_internal(btree_fanout);
     right_internal.is_leaf = false;
     right_internal.node_address = right_internal_address;
@@ -738,7 +831,8 @@ void ComputeServer::handle_root_split(
     }
     
     // Create new root node (internal node)
-    uint64_t new_root_address = allocate_node_address(next_node_id++, 0);
+    next_node_id++;  // Increment node counter
+    uint64_t new_root_address = allocate_node_address();
     BTreeNode new_root(btree_fanout);
     new_root.is_leaf = false;
     new_root.node_address = new_root_address;
@@ -831,7 +925,8 @@ void ComputeServer::handle_leaf_split(
     uint32_t split_point = (btree_fanout - 1) / 2;  // Left gets smaller half if odd
     
     // Create right sibling leaf (new node)
-    uint64_t right_leaf_address = allocate_node_address(next_node_id++, op.current_level);
+    next_node_id++;  // Increment node counter
+    uint64_t right_leaf_address = allocate_node_address();
     BTreeNode right_leaf(btree_fanout);
     right_leaf.is_leaf = true;
     right_leaf.node_address = right_leaf_address;
@@ -1029,12 +1124,95 @@ SST::Interfaces::StandardMem* ComputeServer::get_interface_for_address(uint64_t 
     return memory_interfaces[server_id];
 }
 
-uint64_t ComputeServer::allocate_node_address(uint64_t node_id, uint32_t level) {
-    uint64_t server_id = node_id % num_memory_nodes;
-    uint64_t level_base = level * 0x10000;
-    uint64_t node_offset = (node_id / num_memory_nodes) * get_serialized_node_size();
+uint64_t ComputeServer::allocate_node_address() {
+    // Use round-robin memory server selection
+    uint32_t memory_server_id = current_memory_server;
     
-    return MEMORY_BASE_ADDRESS + (server_id * MEMORY_SERVER_SIZE) + level_base + node_offset;
+    // Calculate how many nodes fit in a chunk
+    size_t node_size = get_serialized_node_size();
+    uint32_t max_nodes_per_chunk = MemoryServer::CHUNK_SIZE / node_size;
+    const uint32_t PREALLOCATE_THRESHOLD = 10;  // Request new chunk when 10 nodes left
+    
+    // Check if we have any chunks for this memory server
+    // Note: This should only be true if the initial chunk allocation is still pending
+    // or if there was a failure in the chunk allocation system
+    if (allocated_chunks.find(memory_server_id) == allocated_chunks.end() ||
+        allocated_chunks[memory_server_id].empty()) {
+        
+        out.output("⚠️ Compute %d: No chunks available for server %u yet!\n",
+                  node_id, memory_server_id);
+        out.fatal(CALL_INFO, -1, 
+                 "FATAL: No chunks available for memory server %u.\n"
+                 "This should not happen since setup() requests initial chunk.\n"
+                 "Possible causes:\n"
+                 "  1. Chunk allocation response not received yet (timing issue)\n"
+                 "  2. Chunk allocation failed\n"
+                 "  3. Memory server is full\n",
+                 memory_server_id);
+    }
+    
+    // Get the most recent chunk (last in vector)
+    std::vector<ChunkInfo>& chunks = allocated_chunks[memory_server_id];
+    ChunkInfo& current_chunk = chunks.back();
+    
+    // Check if current chunk is completely full
+    if (current_chunk.nodes_used >= max_nodes_per_chunk) {
+        if (verbose_level >= 1) {
+            out.output("⚠️ Compute %d: Chunk %u FULL (%u/%u nodes), moving to next memory server\n",
+                      node_id, current_chunk.chunk_id, current_chunk.nodes_used, max_nodes_per_chunk);
+        }
+        
+        // Move to next memory server in round-robin fashion
+        current_memory_server = (current_memory_server + 1) % num_memory_nodes;
+        memory_server_id = current_memory_server;
+        
+        if (verbose_level >= 1) {
+            out.output("   Round-robin: Now using memory server %u\n", memory_server_id);
+        }
+        
+        // Get chunks from new memory server
+        if (allocated_chunks.find(memory_server_id) == allocated_chunks.end() ||
+            allocated_chunks[memory_server_id].empty()) {
+            out.output("⚠️ Compute %d: Memory server %u has no chunks available!\n",
+                      node_id, memory_server_id);
+            out.fatal(CALL_INFO, -1, 
+                     "FATAL: Next memory server %u has no chunks.\n"
+                     "Pre-allocation of next chunk should have happened earlier!\n",
+                     memory_server_id);
+        }
+        
+        // Use the most recent chunk from new server
+        chunks = allocated_chunks[memory_server_id];
+        current_chunk = chunks.back();
+    }
+    
+    // Pre-allocate next chunk when current chunk is almost full (10 nodes left)
+    uint32_t nodes_remaining = max_nodes_per_chunk - current_chunk.nodes_used;
+    if (nodes_remaining == PREALLOCATE_THRESHOLD) {
+        // Calculate which memory server will be next
+        uint32_t next_memory_server = (current_memory_server + 1) % num_memory_nodes;
+        
+        if (verbose_level >= 1) {
+            out.output("📦 Compute %d: Only %u nodes left in current chunk, pre-allocating from server %u\n",
+                      node_id, nodes_remaining, next_memory_server);
+        }
+        
+        // Request chunk from next memory server (async, won't block)
+        request_chunk_allocation(next_memory_server);
+    }
+    
+    // Allocate from current chunk
+    uint64_t node_address = current_chunk.chunk_address + (current_chunk.nodes_used * node_size);
+    current_chunk.nodes_used++;
+    next_node_id++;  // Track total nodes allocated (for statistics)
+    
+    if (verbose_level >= 3) {
+        out.output("✅ Compute %d: Allocated 0x%lx from chunk %u (server %u, %u/%u nodes used)\n",
+                  node_id, node_address, current_chunk.chunk_id, memory_server_id, 
+                  current_chunk.nodes_used, max_nodes_per_chunk);
+    }
+    
+    return node_address;
 }
 
 void ComputeServer::initialize_btree() {
@@ -1111,4 +1289,116 @@ void ComputeServer::process_btree_operation(const WorkloadOp& op) {
     } else if (op.op_type == BTREE_INSERT) {
         btree_insert_async(op.key, op.value);
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CHUNK ALLOCATION VIA MAGIC ADDRESS PROTOCOL
+// ═══════════════════════════════════════════════════════════════════════════
+
+void ComputeServer::request_chunk_allocation(uint32_t memory_server_id) {
+    if (memory_server_id >= num_memory_nodes) {
+        out.output("ERROR: Invalid memory_server_id %u (max %u)\n", 
+                  memory_server_id, num_memory_nodes - 1);
+        return;
+    }
+    
+    if (verbose_level >= 1) {
+        out.output("📦 Compute %d → Memory %d: REQUEST_CHUNK (magic address protocol)\n",
+                  node_id, memory_server_id);
+    }
+    
+    // Construct magic address: MAGIC_ALLOCATE_CHUNK_BASE | memory_server_id
+    uint64_t magic_address = MAGIC_ALLOCATE_CHUNK_BASE | memory_server_id;
+    
+    // Create READ request to magic address
+    // Request 12 bytes: [chunk_id (4 bytes)] [chunk_address (8 bytes)]
+    auto read_req = new SST::Interfaces::StandardMem::Read(magic_address, 12);
+    
+    // Create AsyncOperation to track this request
+    AsyncOperation chunk_op;
+    chunk_op.type = AsyncOperation::CHUNK_ALLOCATE;  // ← Properly set the type!
+    chunk_op.chunk_allocation_complete = false;
+    chunk_op.chunk_allocation_failed = false;
+    chunk_op.memory_server_id = memory_server_id;    // ← Store which memory server
+    chunk_op.start_time = getCurrentSimTime();
+    
+    SST::Interfaces::StandardMem::Request::id_t req_id = read_req->getID();
+    pending_ops[req_id] = chunk_op;
+    
+    // Send to the appropriate memory server interface
+    SST::Interfaces::StandardMem* interface = memory_interfaces[memory_server_id];
+    interface->send(read_req);
+    
+    if (verbose_level >= 2) {
+        out.output("   Sent READ to magic address 0x%lx (req_id=%lu)\n", 
+                  magic_address, req_id);
+    }
+}
+
+void ComputeServer::handle_chunk_allocation_response(
+    SST::Interfaces::StandardMem::Request::id_t req_id,
+    SST::Interfaces::StandardMem::ReadResp* resp) {
+    
+    if (!pending_ops.count(req_id)) {
+        out.output("WARNING: Received chunk allocation response for unknown request ID %lu\n", req_id);
+        return;
+    }
+    
+    auto& op = pending_ops[req_id];
+    
+    // Verify this is a chunk allocation operation
+    if (op.type != AsyncOperation::CHUNK_ALLOCATE) {
+        out.output("ERROR: handle_chunk_allocation_response called for non-CHUNK_ALLOCATE operation (type=%d)\n", 
+                  op.type);
+        return;
+    }
+    
+    // Parse response: [chunk_id (4 bytes)] [chunk_address (8 bytes)]
+    if (resp->data.size() < 4) {
+        out.output("ERROR: Chunk allocation response has insufficient data (%zu bytes)\n", 
+                  resp->data.size());
+        op.chunk_allocation_failed = true;
+        pending_ops.erase(req_id);
+        return;
+    }
+    
+    uint32_t chunk_id;
+    memcpy(&chunk_id, resp->data.data(), sizeof(uint32_t));
+    
+    if (chunk_id == 0xFFFFFFFF) {
+        // Allocation failed
+        out.output("❌ Compute %d: Chunk allocation FAILED from memory server\n", node_id);
+        op.chunk_allocation_failed = true;
+    } else {
+        // Success! Extract chunk address from response
+        uint64_t chunk_address = 0;
+        if (resp->data.size() >= 12) {
+            memcpy(&chunk_address, resp->data.data() + 4, sizeof(uint64_t));
+        }
+        
+        out.output("✅ Compute %d: Chunk allocation SUCCESS\n", node_id);
+        out.output("   chunk_id=%u, address=0x%lx\n", chunk_id, chunk_address);
+        
+        op.chunk_allocation_complete = true;
+        op.allocated_chunk_id = chunk_id;
+        op.allocated_chunk_address = chunk_address;
+        
+        // Record latency
+        SimTime_t latency = getCurrentSimTime() - op.start_time;
+        if (verbose_level >= 2) {
+            out.output("   Allocation latency: %lu ns\n", latency);
+        }
+        
+        // **PERSIST THE CHUNK INFO**
+        // Add this chunk to the list of chunks for this memory server
+        uint32_t memory_server_id = op.memory_server_id;
+        allocated_chunks[memory_server_id].push_back(ChunkInfo(chunk_id, chunk_address));
+        
+        size_t num_chunks = allocated_chunks[memory_server_id].size();
+        out.output("   Added chunk to memory server %u (now has %zu chunks)\n", 
+                  memory_server_id, num_chunks);
+    }
+    
+    // Remove operation from pending
+    pending_ops.erase(req_id);
 }

@@ -28,8 +28,10 @@ MemoryServer::MemoryServer(ComponentId_t id, Params& params) :
     btree_node_size = params.find<size_t>("btree_node_size", 4096);
     verbose_level = params.find<int>("verbose", 0);
 
-    // Calculate base address for this memory server - each server gets 16MB address space
-    base_address = 0x10000000 + memory_server_id * 0x1000000;  // 16MB per server
+    // Calculate base address for this memory server
+    // Address space per server = 64KB (metadata) + (CHUNKS_PER_SERVER * CHUNK_SIZE)
+    uint64_t address_space_per_server = 0x10000 + (CHUNKS_PER_SERVER * CHUNK_SIZE);
+    base_address = 0x10000000 + memory_server_id * address_space_per_server;
 
     // Setup debug output with maximum verbosity for address visibility
     dbg.init("", 5, 0, (Output::output_location_t)1);  // Force high verbosity
@@ -89,9 +91,16 @@ MemoryServer::MemoryServer(ComponentId_t id, Params& params) :
     out.output("  Many-to-Many connectivity: %d interfaces loaded\n", (int)mem_interfaces.size() + 1);
     out.output("  Can accept connections from ALL compute servers\n");
 
+    // Initialize chunk allocation state
+    chunk_allocated.resize(CHUNKS_PER_SERVER, false);  // All chunks initially free
+    next_free_chunk_hint = 0;  // Start searching from chunk 0
+    
     out.output("Memory Server %d initialized\n", memory_server_id);
     out.output("  Capacity: %lu GB, Base address: 0x%lx\n", 
                memory_capacity / (1024*1024*1024), base_address);
+    out.output("  Chunk allocation: %lu chunks of %lu MB each (%lu GB total)\n",
+               CHUNKS_PER_SERVER, CHUNK_SIZE / (1024*1024), 
+               (CHUNKS_PER_SERVER * CHUNK_SIZE) / (1024*1024*1024));
 }
 
 MemoryServer::~MemoryServer() {
@@ -162,6 +171,33 @@ void MemoryServer::handleMemoryEvent(SST::Interfaces::StandardMem::Request* req)
 void MemoryServer::handleMemoryEventFromInterface(SST::Interfaces::StandardMem::Request* req, int interface_id) {
     dbg.debug(CALL_INFO, 2, 0, "Received memory event from interface %d: %s (ID=%lu)\n", 
               interface_id, req->getString().c_str(), req->getID());
+    
+    // Check for magic address operations first
+    uint64_t address = 0;
+    if (auto ll_req = dynamic_cast<SST::Interfaces::StandardMem::LoadLink*>(req)) {
+        address = ll_req->pAddr;
+    } else if (auto sc_req = dynamic_cast<SST::Interfaces::StandardMem::StoreConditional*>(req)) {
+        address = sc_req->pAddr;
+    } else if (auto read_req = dynamic_cast<SST::Interfaces::StandardMem::Read*>(req)) {
+        address = read_req->pAddr;
+    } else if (auto write_req = dynamic_cast<SST::Interfaces::StandardMem::Write*>(req)) {
+        address = write_req->pAddr;
+    }
+    
+    // Check if this is a magic address operation
+    uint64_t magic_base = MAGIC_ALLOCATE_CHUNK_BASE;
+    if ((address & 0xFFFFFFFF00000000ULL) == magic_base) {
+        // This is a chunk allocation request
+        if (auto read_req = dynamic_cast<SST::Interfaces::StandardMem::Read*>(req)) {
+            handle_magic_allocate_chunk(read_req, interface_id);
+            return;
+        } else {
+            out.output("⚠️  Memory %d: Magic address 0x%lx accessed with non-Read operation\n", 
+                      memory_server_id, address);
+            delete req;
+            return;
+        }
+    }
     
     // Handle incoming remote memory requests with interface ID for proper response routing
     if (auto ll_req = dynamic_cast<SST::Interfaces::StandardMem::LoadLink*>(req)) {
@@ -501,10 +537,68 @@ std::vector<uint8_t> MemoryServer::load_btree_node(uint64_t address) {
     return read_memory(address, btree_node_size);
 }
 
+// ===== CHUNK ALLOCATION METHODS =====
+
+int32_t MemoryServer::allocate_chunk() {
+    // Linear search for first free chunk, starting from hint
+    for (uint64_t i = 0; i < CHUNKS_PER_SERVER; i++) {
+        uint32_t chunk_id = (next_free_chunk_hint + i) % CHUNKS_PER_SERVER;
+        
+        if (!chunk_allocated[chunk_id]) {
+            // Found a free chunk
+            chunk_allocated[chunk_id] = true;
+            next_free_chunk_hint = (chunk_id + 1) % CHUNKS_PER_SERVER;  // Update hint for next allocation
+            
+            if (verbose_level >= 2) {
+                out.output("Allocated chunk %u (address 0x%lx)\n", 
+                          chunk_id, chunk_id_to_address(chunk_id));
+            }
+            
+            return chunk_id;
+        }
+    }
+    
+    // No free chunks available
+    if (verbose_level >= 1) {
+        out.output("ERROR: No free chunks available (all %lu chunks allocated)\n", CHUNKS_PER_SERVER);
+    }
+    return -1;
+}
+
+void MemoryServer::free_chunk(uint32_t chunk_id) {
+    if (chunk_id >= CHUNKS_PER_SERVER) {
+        out.output("ERROR: Invalid chunk_id %u (max %lu)\n", chunk_id, CHUNKS_PER_SERVER);
+        return;
+    }
+    
+    if (!chunk_allocated[chunk_id]) {
+        out.output("WARNING: Attempted to free already-free chunk %u\n", chunk_id);
+        return;
+    }
+    
+    chunk_allocated[chunk_id] = false;
+    next_free_chunk_hint = chunk_id;  // Next allocation can start from this freed chunk
+    
+    if (verbose_level >= 2) {
+        out.output("Freed chunk %u (address 0x%lx)\n", 
+                  chunk_id, chunk_id_to_address(chunk_id));
+    }
+}
+
+uint64_t MemoryServer::chunk_id_to_address(uint32_t chunk_id) {
+    // Calculate base address of chunk within this memory server's address space
+    // Start chunks at offset 0x10000 (64KB) from base to leave room for root and metadata
+    uint64_t chunk_pool_base = base_address + 0x10000;
+    return chunk_pool_base + (chunk_id * CHUNK_SIZE);
+}
+
 bool MemoryServer::is_address_in_range(uint64_t address) {
     // Check if address is within this memory server's allocated range
+    // Range = base_address to (base_address + chunk_pool + all chunks)
+    // chunk_pool starts at base_address + 0x10000 (64KB for root/metadata)
+    // total range = 64KB metadata + (CHUNKS_PER_SERVER * CHUNK_SIZE)
     uint64_t range_start = base_address;
-    uint64_t range_end = base_address + 0x1000000;  // 16MB per server
+    uint64_t range_end = base_address + 0x10000 + (CHUNKS_PER_SERVER * CHUNK_SIZE);
     
     bool in_range = (address >= range_start) && (address < range_end);
     
@@ -766,4 +860,86 @@ bool MemoryServer::is_locked_exclusive(uint64_t node_address) {
     NodeLock lock;
     lock.state = state;
     return lock.is_exclusive();
+}
+
+// ===== MAGIC ADDRESS HANDLER FOR CHUNK ALLOCATION =====
+
+void MemoryServer::handle_magic_allocate_chunk(SST::Interfaces::StandardMem::Read* req, int interface_id) {
+    uint64_t address = req->pAddr;
+    uint32_t requested_server_id = address & 0xFFFFFFFF;
+    
+    dbg.debug(CALL_INFO, 2, 0, "MAGIC: Allocate chunk request for server %u from interface %d\n", 
+              requested_server_id, interface_id);
+    
+    out.output("🪄 Memory %d ← Compute: ALLOCATE_CHUNK request (magic address 0x%lx) [READ operation]\n", 
+               memory_server_id, address);
+    
+    // Verify the request is for this memory server
+    if (requested_server_id != memory_server_id) {
+        out.output("WARNING: Memory Server %d received chunk allocation request for server %u\n", 
+                   memory_server_id, requested_server_id);
+        
+        // Send failure response (0xFFFFFFFF)
+        std::vector<uint8_t> failure_data(4);
+        uint32_t failure_value = 0xFFFFFFFF;
+        memcpy(failure_data.data(), &failure_value, sizeof(uint32_t));
+        
+        auto read_resp = new SST::Interfaces::StandardMem::ReadResp(req, failure_data);
+        
+        SST::Interfaces::StandardMem* response_interface = nullptr;
+        if (interface_id >= 0 && interface_id < (int)all_mem_interfaces.size()) {
+            response_interface = all_mem_interfaces[interface_id];
+        } else {
+            response_interface = mem_interface;
+        }
+        response_interface->send(read_resp);
+        delete req;
+        return;
+    }
+    
+    // Allocate a chunk
+    int32_t chunk_id = allocate_chunk();
+    
+    if (chunk_id < 0) {
+        // Allocation failed - no free chunks
+        out.output("   ✗ ALLOCATE_CHUNK FAILED: No free chunks available\n");
+        
+        std::vector<uint8_t> failure_data(4);
+        uint32_t failure_value = 0xFFFFFFFF;
+        memcpy(failure_data.data(), &failure_value, sizeof(uint32_t));
+        
+        auto read_resp = new SST::Interfaces::StandardMem::ReadResp(req, failure_data);
+        
+        SST::Interfaces::StandardMem* response_interface = nullptr;
+        if (interface_id >= 0 && interface_id < (int)all_mem_interfaces.size()) {
+            response_interface = all_mem_interfaces[interface_id];
+        } else {
+            response_interface = mem_interface;
+        }
+        response_interface->send(read_resp);
+        
+    } else {
+        // Allocation succeeded
+        uint64_t chunk_address = chunk_id_to_address(chunk_id);
+        out.output("   ✓ ALLOCATE_CHUNK SUCCESS: chunk_id=%d, address=0x%lx\n", 
+                  chunk_id, chunk_address);
+        
+        // Send response with chunk_id and address
+        // Response format: [chunk_id (4 bytes)] [chunk_address (8 bytes)]
+        std::vector<uint8_t> success_data(12);
+        memcpy(success_data.data(), &chunk_id, sizeof(uint32_t));
+        memcpy(success_data.data() + 4, &chunk_address, sizeof(uint64_t));
+        
+        auto read_resp = new SST::Interfaces::StandardMem::ReadResp(req, success_data);
+        
+        SST::Interfaces::StandardMem* response_interface = nullptr;
+        if (interface_id >= 0 && interface_id < (int)all_mem_interfaces.size()) {
+            response_interface = all_mem_interfaces[interface_id];
+        } else {
+            response_interface = mem_interface;
+        }
+        response_interface->send(read_resp);
+    }
+    
+    delete req;
 }

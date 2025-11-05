@@ -77,6 +77,10 @@ enum LockOperation {
 
 class MemoryServer : public SST::Component {
 public:
+    // ===== PUBLIC CHUNK ALLOCATION CONSTANTS =====
+    static constexpr uint64_t CHUNK_SIZE = 8 * 1024 * 1024;  // 8MB per chunk
+    static constexpr uint64_t CHUNKS_PER_SERVER = 128;        // 128 chunks = 1GB
+    
     SST_ELI_REGISTER_COMPONENT(
         MemoryServer,
         "rdmaNic",
@@ -164,6 +168,19 @@ public:
     // B+tree node management
     void store_btree_node(uint64_t address, const std::vector<uint8_t>& node_data);
     std::vector<uint8_t> load_btree_node(uint64_t address);
+    
+    // Chunk allocation
+    int32_t allocate_chunk();  // Returns chunk_id or -1 if no free chunks
+    void free_chunk(uint32_t chunk_id);
+    uint64_t chunk_id_to_address(uint32_t chunk_id);  // Convert chunk_id to base address
+    
+    // ===== MAGIC ADDRESS PROTOCOL =====
+    // Special addresses for chunk management operations
+    static constexpr uint64_t MAGIC_ALLOCATE_CHUNK_BASE = 0xFFFFFFFF00000000ULL;
+    // Request: READ from (MAGIC_ALLOCATE_CHUNK_BASE | memory_server_id)
+    // Response: ReadResp contains chunk_id (32-bit) or 0xFFFFFFFF if failed
+    
+    void handle_magic_allocate_chunk(SST::Interfaces::StandardMem::Read* req, int interface_id);
 
 private:
     // Configuration
@@ -178,6 +195,11 @@ private:
     std::unordered_map<uint64_t, MemoryBlock> memory_blocks;
     uint64_t memory_used;            // Bytes currently used
     uint64_t base_address;           // Base address for this memory server
+    
+    // ===== CHUNK ALLOCATION =====
+    // Each memory server manages chunks (8MB each) for B+tree node allocation
+    std::vector<bool> chunk_allocated;  // Bitmap: true if chunk is allocated
+    uint64_t next_free_chunk_hint;      // Hint for next free chunk (optimization)
     
     // ===== LOCK STATISTICS =====
     // No separate lock table - locks are embedded in memory

@@ -85,7 +85,8 @@ struct AsyncOperation {
         SPLIT_INTERNAL,   // Splitting an internal node
         UPDATE_PARENT,    // Updating parent after split
         INIT_WRITE,       // Initial tree write (for tracking completion)
-        VALIDITY_CHECK    // Checking validity bit for initialization synchronization
+        VALIDITY_CHECK,   // Checking validity bit for initialization synchronization
+        CHUNK_ALLOCATE    // Chunk allocation request via magic address
     };
     
     // Split operation phases
@@ -140,6 +141,13 @@ struct AsyncOperation {
     // Operation completion tracking
     bool ready_to_complete;             // Operation logic done, waiting for lock release
     
+    // Chunk allocation tracking (for CHUNK_ALLOCATE operations)
+    bool chunk_allocation_complete;     // Chunk allocation successful
+    bool chunk_allocation_failed;       // Chunk allocation failed
+    uint32_t allocated_chunk_id;        // Chunk ID returned from memory server
+    uint64_t allocated_chunk_address;   // Chunk base address returned from memory server
+    uint32_t memory_server_id;          // Which memory server this chunk request was sent to
+    
     // Constructor
     AsyncOperation() : type(TRAVERSAL), key(0), value(0), current_level(0), 
                       current_address(0), start_time(0), split_phase(NONE),
@@ -150,7 +158,9 @@ struct AsyncOperation {
                       waiting_for_release_ll(false), waiting_for_release_sc(false),
                       release_lock_index(0), release_lock_value(0),
                       waiting_for_write(false), need_exclusive_lock(false), lock_retry_count(0),
-                      ready_to_complete(false) {}
+                      ready_to_complete(false),
+                      chunk_allocation_complete(false), chunk_allocation_failed(false),
+                      allocated_chunk_id(0), allocated_chunk_address(0), memory_server_id(0) {}
 };
 
 } // namespace MemHierarchy

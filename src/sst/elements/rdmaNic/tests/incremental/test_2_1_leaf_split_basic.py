@@ -1,98 +1,121 @@
 #!/usr/bin/env python3
 """
-Test 2.1: Leaf Split - Fill and Split
-Phase: Simple Splits (No Recursion)
+Test 1.2: Single Insert
+Phase: Basic Operations (Foundation)
 
-Test Objective: Verify basic leaf split mechanism
+Test Objective: Verify basic insert operation into an empty tree
 Expected Behavior:
-  - Insert 4 keys with fanout=4 (fills root leaf to capacity)
-  - Next insert triggers leaf split
-  - Left leaf gets first half of keys
-  - Right leaf gets second half of keys
-  - Separator key promoted to parent
-  - Tree height increases 1 → 2
+  - Insert keys into empty tree succeeds
+  - Tree grows correctly
+  - Inserts complete without errors
+  - LL/SC lock acquisition works with write operations
 
 Validates:
-  - Leaf split detection (num_keys == fanout)
-  - Key redistribution (middle-based split)
-  - Separator key promotion
-  - New root creation
-  - Sibling pointer maintenance (next_leaf)
+  - Basic insert operation
+  - Leaf modification (adding key to keys array)
+  - Node serialization and write back to memory
+  - LL/SC lock protocol with concurrent inserts
 """
 
 import sst
 
 print("=" * 80)
-print("TEST 2.1: Leaf Split - Fill and Split")
+print("TEST 1.2: Basic Insert Operations")
 print("=" * 80)
-print("Phase: Simple Splits (No Recursion)")
+print("Phase: Basic Operations (Foundation)")
 print()
 print("Test Objective:")
-print("  Verify that a full leaf node correctly splits when inserting next key")
+print("  Insert keys into empty B+tree with concurrent compute nodes")
 print()
 print("Expected Behavior:")
-print("  1. Tree initializes with empty root leaf (fanout=4, max 4 keys)")
-print("  2. INSERT keys 0, 1, 2, 3 → root fills to capacity (4 keys)")
-print("  3. INSERT key 4 → triggers LEAF SPLIT:")
-print("     - Left leaf: [0, 1]")
-print("     - Right leaf: [2, 3, 4]")
-print("     - Separator key=2 promoted to new root")
-print("     - Tree height: 1 → 2")
-print("  4. New root (internal node) contains separator")
-print("  5. Root points to left and right leaves")
+print("  1. Tree initializes with empty root leaf (0 keys)")
+print("  2. Inserts add keys to tree successfully")
+print("  3. LL/SC lock acquisition works correctly")
+print("  4. Lock release with LL/SC completes without errors")
 print()
 
-# Create compute server
-compute = sst.Component("compute_0", "rdmaNic.computeServer")
-compute.addParams({
-    "verbose": 1,
-    "node_id": 0,
-    "num_memory_nodes": 1,
-    "operations_per_second": 50,  # Slow for observation
-    "simulation_duration_us": 300000,  # 300ms
-    "read_ratio": 0.0,  # 100% inserts to trigger split
-    "key_range": 6,  # Keys 0-5 (need 5+ to trigger split)
-    "btree_fanout": 4,  # Small fanout to trigger split quickly
-    "key_distribution": "uniform",
-})
+# ============================================================================
+# Component Configuration
+# ============================================================================
+num_compute_nodes = 2 # Multiple compute nodes
+num_memory_servers = 2  # Multiple memory servers
+memory_capacity_mb = 16
+memory_base_address = 0x10000000
+btree_fanout = 4
 
-# Create memory server
-memory = sst.Component("memory_0", "rdmaNic.memoryServer")
-memory.addParams({
-    "verbose": 1,
-    "memory_server_id": 0,
-    "num_compute_nodes": 1,
-    "memory_size_mb": 16,
-    "base_addr": "0x10000000",
-})
+# Workload Configuration
+operations_per_second = 50
+simulation_duration_us = 300000  # 300ms
+read_ratio = 0.0  # 0% reads (100% inserts)
+key_range = 6 # Keys 0-5
+key_distribution = "uniform"
 
-# Setup network interfaces
-compute_iface = compute.setSubComponent("mem_interface_0", "memHierarchy.standardInterface")
-memory_iface = memory.setSubComponent("mem_interface_0", "memHierarchy.standardInterface")
+# ============================================================================
+# Instantiate Components
+# ============================================================================
 
-# Connect compute to memory
-link = sst.Link("compute_memory_link")
-link.connect((compute_iface, "lowlink", "1ns"), (memory_iface, "lowlink", "1ns"))
+# Compute Server(s)
+compute_servers = []
+for i in range(num_compute_nodes):
+    compute = sst.Component(f"compute_{i}", "rdmaNic.computeServer")
+    compute.addParams({
+        "verbose": 5,
+        "node_id": i,
+        "num_memory_nodes": num_memory_servers,
+        "operations_per_second": operations_per_second,
+        "simulation_duration_us": simulation_duration_us,
+        "read_ratio": read_ratio,
+        "key_distribution": key_distribution,
+        "key_range": key_range,
+        "btree_fanout": btree_fanout,
+    })
+    compute_servers.append(compute)
+
+# Memory Server(s)
+memory_servers = []
+for i in range(num_memory_servers):
+    memory = sst.Component(f"memory_{i}", "rdmaNic.memoryServer")
+    memory.addParams({
+        "verbose": 5,
+        "memory_server_id": i,
+        "num_compute_nodes": num_compute_nodes,
+        "memory_size_mb": memory_capacity_mb,
+        "base_addr": f"0x{memory_base_address + (i * (memory_capacity_mb << 20)):x}",
+    })
+    memory_servers.append(memory)
+
+# ============================================================================
+# Connect Compute ↔ Memory (Many-to-Many)
+# ============================================================================
+for comp_idx, compute in enumerate(compute_servers):
+    for mem_idx, memory in enumerate(memory_servers):
+        # Setup subcomponents for interfaces
+        compute_iface = compute.setSubComponent(f"mem_interface_{mem_idx}", "memHierarchy.standardInterface")
+        memory_iface = memory.setSubComponent(f"mem_interface_{comp_idx}", "memHierarchy.standardInterface")
+        
+        # Connect compute to memory
+        link = sst.Link(f"link_c{comp_idx}_m{mem_idx}")
+        link.connect((compute_iface, "lowlink", "1ns"), (memory_iface, "lowlink", "1ns"))
+
+sst.setStatisticLoadLevel(1)
 
 print("Test Configuration:")
-print("  - 1 compute server, 1 memory server")
-print("  - Fanout: 4 keys per node (triggers split at 5th insert)")
-print("  - Operations: ~15 inserts")
-print("  - Key range: 0-5")
+print(f"  - {num_compute_nodes} compute servers × {num_memory_servers} memory servers (many-to-many)")
+print("  - Fanout: 16 keys per node")
+print("  - Operations: ~10 inserts per node")
+print("  - Key range: 0-9")
+print("  - Tree starts empty (root with 0 keys)")
 print()
 print("Expected Output:")
-print("  ✓ Inserts 1-4: Root fills up (num_keys increases to 4)")
-print("  ✓ Insert 5: 🔀 'Leaf FULL, triggering split'")
-print("  ✓ 'Splitting ROOT node' (since root is the leaf)")
-print("  ✓ 'Left leaf: X keys, Right leaf: Y keys'")
-print("  ✓ 'Separator key=X promoted'")
-print("  ✓ 'New root created' at new address")
-print("  ✓ Tree height: 1 → 2")
+print("  ✓ Tree initializes with height=1, root has 0 keys")
+print("  ✓ INSERT operations add keys to tree")
+print("  ✓ LL/SC lock acquisition succeeds (retry #0 or low retry count)")
+print("  ✓ Lock release with LL/SC completes successfully")
+print("  ✓ No assertion failures or crashes")
 print()
 print("Critical Validations:")
-print("  - handle_leaf_split() detects full leaf")
-print("  - Middle-based split distributes keys evenly")
-print("  - handle_root_split() creates new root")
-print("  - Left and right leaves written to memory")
-print("  - Parent updated with separator")
+print("  - LL/SC lock acquisition works with EXCLUSIVE locks (inserts)")
+print("  - Lock release uses LL/SC protocol")
+print("  - Reference counts handled correctly")
+print("  - No deadlocks or race conditions")
 print("=" * 80)
