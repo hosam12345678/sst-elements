@@ -54,8 +54,10 @@ public:
      * @param fanout Number of keys per node
      * @param verbose Verbosity level for debug output
      * @param output Output object for logging
+     * NOTE: root_address and tree_height are NO LONGER stored locally!
+     * They are read from ROOT_METADATA_ADDRESS at the start of each operation.
      */
-    BTreeOperations(uint64_t& root_addr, uint32_t fanout, int verbose, SST::Output* output);
+    BTreeOperations(uint32_t fanout, int verbose, SST::Output* output);
     
     /**
      * Initiate async B+tree insert operation
@@ -94,10 +96,12 @@ public:
         SST::Statistics::Statistic<uint64_t>* stat_reads);
 
 private:
-    uint64_t& root_address_;       // Reference to root address (may change with splits)
     uint32_t btree_fanout_;        // Number of keys per node
     int verbose_level_;            // Verbosity for debug output
     SST::Output* out_;             // Output object for logging
+    
+    // NOTE: root_address and tree_height are NO LONGER stored here!
+    // They are read from ROOT_METADATA_ADDRESS at the start of each operation.
 };
 
 } // namespace MemHierarchy

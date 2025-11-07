@@ -59,6 +59,11 @@ struct BTreeNode {
         next_leaf = 0;  // 0 means no next leaf
     }
     
+    // Check if node is safe for insert (won't cause split)
+    bool is_safe_for_insert() const {
+        return num_keys < fanout - 1;  // Has space for at least one more key
+    }
+    
     // Lock header size (prepended to serialized node)
     static constexpr size_t LOCK_HEADER_SIZE = 8;
 };
@@ -78,15 +83,17 @@ struct BTreeNode {
 struct AsyncOperation {
     // Operation types
     enum Type { 
-        TRAVERSAL,        // Walking down the tree
-        INSERT,           // Inserting a key-value pair
-        SEARCH,           // Searching for a key
-        SPLIT_LEAF,       // Splitting a leaf node
-        SPLIT_INTERNAL,   // Splitting an internal node
-        UPDATE_PARENT,    // Updating parent after split
-        INIT_WRITE,       // Initial tree write (for tracking completion)
-        VALIDITY_CHECK,   // Checking validity bit for initialization synchronization
-        CHUNK_ALLOCATE    // Chunk allocation request via magic address
+        TRAVERSAL,         // Walking down the tree
+        INSERT,            // Inserting a key-value pair
+        SEARCH,            // Searching for a key
+        SPLIT_LEAF,        // Splitting a leaf node
+        SPLIT_INTERNAL,    // Splitting an internal node
+        UPDATE_PARENT,     // Updating parent after split
+        INIT_WRITE,        // Initial tree write (for tracking completion)
+        VALIDITY_CHECK,    // Checking validity bit for initialization synchronization
+        CHUNK_ALLOCATE,    // Chunk allocation request via magic address
+        READ_ROOT_METADATA, // Reading root metadata (root pointer + tree height)
+        RESTART_SIGNAL     // Signal to restart operation after lock release
     };
     
     // Split operation phases
@@ -106,6 +113,7 @@ struct AsyncOperation {
     uint64_t current_address;           // Current node address
     std::vector<BTreeNode> path;        // Nodes visited so far (for splits)
     uint64_t start_time;                // When operation started (SimTime_t)
+    uint32_t tree_height;               // Tree height (read from metadata at operation start)
     
     // Split operation state
     SplitPhase split_phase;             // Which phase of split we're in
@@ -130,7 +138,7 @@ struct AsyncOperation {
     // LL/SC fields for atomic lock release
     bool waiting_for_release_ll;        // Waiting for LoadLink during release
     bool waiting_for_release_sc;        // Waiting for StoreConditional during release
-    uint32_t release_lock_index;        // Index in held_locks[] currently being released
+    int32_t release_lock_index;         // Index in held_locks[] currently being released (signed for decrement check)
     uint64_t release_lock_value;        // Lock value from LoadLink during release
     
     // Write tracking
@@ -141,6 +149,18 @@ struct AsyncOperation {
     // Operation completion tracking
     bool ready_to_complete;             // Operation logic done, waiting for lock release
     
+    // Optimistic locking protocol
+    bool pessimistic_mode;              // true = use exclusive locks during traversal (after restart)
+    
+    // Restart tracking (for restarts after lock release completes)
+    bool restart_pending;               // true = restart operation after locks released
+    uint64_t restart_key;               // Key for restart
+    uint64_t restart_value;             // Value for restart
+    uint64_t restart_start_time;        // Original start time for latency tracking
+    
+    // Root metadata read tracking
+    Type intended_operation_type;       // When type=READ_ROOT_METADATA, this is the actual operation (SEARCH/INSERT)
+    
     // Chunk allocation tracking (for CHUNK_ALLOCATE operations)
     bool chunk_allocation_complete;     // Chunk allocation successful
     bool chunk_allocation_failed;       // Chunk allocation failed
@@ -150,7 +170,8 @@ struct AsyncOperation {
     
     // Constructor
     AsyncOperation() : type(TRAVERSAL), key(0), value(0), current_level(0), 
-                      current_address(0), start_time(0), split_phase(NONE),
+                      current_address(0), start_time(0), tree_height(0),
+                      split_phase(NONE),
                       separator_key(0), parent_address(0), is_root_split(false),
                       waiting_for_lock(false), lock_target_address(0),
                       waiting_for_loadlink_response(false), waiting_for_sc_response(false),
@@ -159,6 +180,9 @@ struct AsyncOperation {
                       release_lock_index(0), release_lock_value(0),
                       waiting_for_write(false), need_exclusive_lock(false), lock_retry_count(0),
                       ready_to_complete(false),
+                      pessimistic_mode(false),
+                      restart_pending(false), restart_key(0), restart_value(0), restart_start_time(0),
+                      intended_operation_type(TRAVERSAL),
                       chunk_allocation_complete(false), chunk_allocation_failed(false),
                       allocated_chunk_id(0), allocated_chunk_address(0), memory_server_id(0) {}
 };

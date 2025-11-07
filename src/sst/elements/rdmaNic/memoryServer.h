@@ -77,9 +77,11 @@ enum LockOperation {
 
 class MemoryServer : public SST::Component {
 public:
-    // ===== PUBLIC CHUNK ALLOCATION CONSTANTS =====
-    static constexpr uint64_t CHUNK_SIZE = 8 * 1024 * 1024;  // 8MB per chunk
-    static constexpr uint64_t CHUNKS_PER_SERVER = 128;        // 128 chunks = 1GB
+    // ===== PUBLIC MEMORY LAYOUT CONSTANTS =====
+    static constexpr uint64_t RESERVED_METADATA_SIZE = 0x1000;  // 4KB reserved at start of each memory server
+    static constexpr uint64_t CHUNK_SIZE = 8 * 1024 * 1024;     // 8MB per chunk
+    static constexpr uint64_t CHUNKS_PER_SERVER = 128;          // 128 chunks = 1GB
+    static constexpr uint64_t ADDRESS_SPACE_PER_SERVER = RESERVED_METADATA_SIZE + (CHUNKS_PER_SERVER * CHUNK_SIZE);
     
     SST_ELI_REGISTER_COMPONENT(
         MemoryServer,
@@ -93,9 +95,6 @@ public:
     SST_ELI_DOCUMENT_PARAMS(
         {"memory_server_id", "Memory server node ID", "0"},
         {"num_compute_nodes", "Total number of compute nodes to accept connections from", "8"},
-        {"memory_capacity_gb", "Memory capacity in GB", "16"},
-        {"memory_latency_ns", "Memory access latency in nanoseconds", "100"},
-        {"btree_node_size", "Size of B+tree nodes in bytes", "4096"},
         {"verbose", "Verbose debug output", "0"}
     )
 
@@ -164,10 +163,6 @@ public:
     // Memory operations
     std::vector<uint8_t> read_memory(uint64_t address, size_t size);
     void write_memory(uint64_t address, const std::vector<uint8_t>& data);
-
-    // B+tree node management
-    void store_btree_node(uint64_t address, const std::vector<uint8_t>& node_data);
-    std::vector<uint8_t> load_btree_node(uint64_t address);
     
     // Chunk allocation
     int32_t allocate_chunk();  // Returns chunk_id or -1 if no free chunks
@@ -186,9 +181,6 @@ private:
     // Configuration
     uint32_t memory_server_id;
     uint32_t num_compute_nodes;      // How many compute nodes to accept connections from
-    uint64_t memory_capacity;        // In bytes
-    SimTime_t memory_latency;        // Access latency
-    size_t btree_node_size;
     int verbose_level;
 
     // Memory storage

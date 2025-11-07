@@ -20,20 +20,31 @@ using namespace SST::MemHierarchy;
 
 // Memory address macros for disaggregated memory
 #define MEMORY_BASE_ADDRESS 0x10000000ULL
-#define MEMORY_SERVER_SIZE 0x1000000ULL
-#define GET_MEMORY_SERVER(addr) (((addr) - MEMORY_BASE_ADDRESS) / MEMORY_SERVER_SIZE)
+#define GET_MEMORY_SERVER(addr) (((addr) - MEMORY_BASE_ADDRESS) / MemoryServer::ADDRESS_SPACE_PER_SERVER)
 
-// Validity bit for B+tree initialization synchronization
-// Put it at a dedicated address that won't interfere with node storage
-// Using the last byte of memory server 0's address space
-#define VALIDITY_BIT_ADDRESS (MEMORY_BASE_ADDRESS + MEMORY_SERVER_SIZE - 1)
-
-// Lock header size - reserved space before node data
-// The lock system uses this space for lock metadata (currently unimplemented)
+// Lock header size - reserved space before node data for lock metadata
 #define LOCK_HEADER_SIZE 8
 
 // Maximum serialized node size (in bytes)
 #define NODE_MAX_SIZE 512
+
+// Root Metadata Node - stores root pointer and tree height
+// This is the SINGLE SOURCE OF TRUTH for tree metadata (no local caching!)
+// Location: Memory Server 0, at base address
+// Layout: [Lock(8)] [root_ptr(8) + tree_height(4) + reserved(up to NODE_MAX_SIZE)]
+// Total size matches regular B+tree nodes for consistency
+#define ROOT_METADATA_ADDRESS (MEMORY_BASE_ADDRESS)
+// Note: ROOT_METADATA_SIZE is not defined here - it uses get_serialized_node_size() like regular nodes
+
+// Validity bit for B+tree initialization synchronization
+// Location: Memory Server 0, placed after ROOT_METADATA to avoid overlap
+// VALIDITY_BIT is at: ROOT_METADATA_ADDRESS + NODE_MAX_SIZE + LOCK_HEADER_SIZE
+// This ensures it's after the maximum possible ROOT_METADATA size
+#define VALIDITY_BIT_OFFSET (NODE_MAX_SIZE + LOCK_HEADER_SIZE)
+#define VALIDITY_BIT_ADDRESS (MEMORY_BASE_ADDRESS + VALIDITY_BIT_OFFSET)
+
+// Special signal address for restart operations (after validity bit)
+#define RESTART_SIGNAL_ADDRESS (VALIDITY_BIT_ADDRESS + 8)
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONSTRUCTOR
@@ -89,9 +100,9 @@ ComputeServer::ComputeServer(ComponentId_t id, Params& params) :
     }
     
     // Initialize B+tree state
-    tree_height = 1;
+    // NOTE: root_address and tree_height are NO LONGER stored locally!
+    // They are read from ROOT_METADATA_ADDRESS at the start of each operation
     next_node_id = 0;
-    root_address = MEMORY_BASE_ADDRESS;  // Root at base address, validity bit is separate
     tree_initialized = false;  // Will be set true after validity bit check passes
     checking_validity_bit = false;  // Will be set true when checking validity
     
@@ -106,7 +117,7 @@ ComputeServer::ComputeServer(ComponentId_t id, Params& params) :
     // Initialize B+tree components
     serializer = new BTreeSerializer(btree_fanout, &out);
     lock_manager = new BTreeLockManager(node_id, verbose_level, &out);
-    btree_ops = new BTreeOperations(root_address, btree_fanout, verbose_level, &out);
+    btree_ops = new BTreeOperations(btree_fanout, verbose_level, &out);
     
     // Initialize workload generator
     workload_gen = new WorkloadGenerator(node_id, key_range, zipfian_alpha, read_ratio,
@@ -137,6 +148,36 @@ ComputeServer::ComputeServer(ComponentId_t id, Params& params) :
     }
     
     out.output("  Many-to-Many connectivity: %d interfaces loaded\n", (int)memory_interfaces.size());
+
+    // Validate memory layout consistency between ComputeServer and MemoryServer
+    // This ensures our address calculations match the memory servers' expectations
+    uint64_t expected_address_space = MemoryServer::ADDRESS_SPACE_PER_SERVER;
+    uint64_t test_addr = MEMORY_BASE_ADDRESS + expected_address_space;
+    uint32_t calculated_server_id = GET_MEMORY_SERVER(test_addr);
+    
+    if (calculated_server_id != 1) {
+        out.fatal(CALL_INFO, -1, 
+                  "Memory layout validation FAILED!\n"
+                  "  ADDRESS_SPACE_PER_SERVER = 0x%lx (%lu bytes)\n"
+                  "  Test address (MS0_base + ADDRESS_SPACE) = 0x%lx\n"
+                  "  Expected server_id: 1, Got: %u\n"
+                  "  GET_MEMORY_SERVER formula: (addr - BASE) / ADDRESS_SPACE_PER_SERVER\n"
+                  "  ComputeServer and MemoryServer have inconsistent memory layout constants!\n",
+                  expected_address_space, expected_address_space,
+                  test_addr, calculated_server_id);
+    }
+    
+    if (verbose_level >= 1) {
+        out.output("Memory layout validated:\n");
+        out.output("  ADDRESS_SPACE_PER_SERVER = 0x%llx (%llu MB)\n", 
+                   (unsigned long long)expected_address_space, (unsigned long long)expected_address_space / (1024*1024));
+        out.output("  RESERVED_METADATA_SIZE = 0x%llx (%llu bytes)\n",
+                   (unsigned long long)MemoryServer::RESERVED_METADATA_SIZE, (unsigned long long)MemoryServer::RESERVED_METADATA_SIZE);
+        out.output("  ROOT_METADATA at 0x%llx (server %llu)\n", 
+                   (unsigned long long)ROOT_METADATA_ADDRESS, (unsigned long long)GET_MEMORY_SERVER(ROOT_METADATA_ADDRESS));
+        out.output("  VALIDITY_BIT at 0x%llx (server %llu)\n",
+                   (unsigned long long)VALIDITY_BIT_ADDRESS, (unsigned long long)GET_MEMORY_SERVER(VALIDITY_BIT_ADDRESS));
+    }
 
     // Setup clock
     clock_handler = new SST::Clock::Handler2<ComputeServer,&ComputeServer::tick>(this);
@@ -200,8 +241,8 @@ void ComputeServer::setup() {
     }
     request_chunk_allocation(current_memory_server);
     
-    // Initialize B+tree after address routing is established
-    initialize_btree();
+    // NOTE: B+tree initialization (node 0 only) will be triggered in tick() 
+    // after chunk allocation completes, ensuring chunks are ready before allocating nodes
 }
 
 void ComputeServer::finish() {
@@ -224,6 +265,12 @@ bool ComputeServer::tick(Cycle_t current_cycle) {
         allocated_chunks[current_memory_server].empty()) {
         // Initial chunk not ready yet - keep waiting
         return false;
+    } else {
+        // Chunks are ready - node 0 can now initialize the tree
+        if (node_id == 0 && !tree_initialized && !checking_validity_bit) {
+            initialize_btree();
+            return false;  // Wait for initialization to complete
+        }
     }
     
     // Wait for tree initialization to complete before starting operations
@@ -262,11 +309,18 @@ bool ComputeServer::tick(Cycle_t current_cycle) {
 void ComputeServer::handleMemoryEvent(Interfaces::StandardMem::Request* req) {
     auto req_id = req->getID();
     
+    // Check if this is a lock operation (LL/SC protocol)
+    if (handle_lock_operations(req)) {
+        delete req;
+        return;
+    }
+
     // Check if this is a special operation (chunk allocation, etc.)
     if (handle_special_operation_response(req)) {
         delete req;
         return;
     }
+    
     
     // Handle regular read/write responses
     if (auto* read_resp = dynamic_cast<Interfaces::StandardMem::ReadResp*>(req)) {
@@ -298,10 +352,33 @@ bool ComputeServer::handle_special_operation_response(Interfaces::StandardMem::R
             }
             break;
             
-        // Add more special operation types here in the future
-        // case AsyncOperation::SOME_OTHER_SPECIAL_OP:
-        //     handle_other_special_op(req_id, req);
-        //     return true;
+        case AsyncOperation::VALIDITY_CHECK:
+            if (auto* read_resp = dynamic_cast<Interfaces::StandardMem::ReadResp*>(req)) {
+                handle_validity_check_response(req_id, read_resp);
+                return true;  // Handled
+            }
+            break;
+            
+        case AsyncOperation::READ_ROOT_METADATA:
+            if (auto* read_resp = dynamic_cast<Interfaces::StandardMem::ReadResp*>(req)) {
+                handle_root_metadata_response(req_id, read_resp->data);
+                return true;  // Handled
+            }
+            break;
+            
+        case AsyncOperation::INIT_WRITE:
+            if (auto* write_resp = dynamic_cast<Interfaces::StandardMem::WriteResp*>(req)) {
+                handle_btree_initialization_write(req_id, op);
+                return true;  // Handled
+            }
+            break;
+            
+        case AsyncOperation::RESTART_SIGNAL:
+            if (auto* write_resp = dynamic_cast<Interfaces::StandardMem::WriteResp*>(req)) {
+                handle_restart_after_lock_release(req_id, op);
+                return true;  // Handled
+            }
+            break;
         
         default:
             // Not a special operation, let normal handlers process it
@@ -312,32 +389,139 @@ bool ComputeServer::handle_special_operation_response(Interfaces::StandardMem::R
 }
 
 void ComputeServer::btree_search_async(uint64_t key) {
+    // Step 1: Read root metadata to get current root address and tree height
+    // We do NOT cache this locally - always read from memory!
     AsyncOperation op;
-    op.type = AsyncOperation::SEARCH;
+    op.type = AsyncOperation::READ_ROOT_METADATA;
+    op.intended_operation_type = AsyncOperation::SEARCH;  // Store the actual operation type
     op.key = key;
     op.current_level = 0;
-    op.current_address = root_address;
     op.start_time = getCurrentSimTime();
     
-    auto interface_getter = [this](uint64_t addr) { return get_interface_for_address(addr); };
-    btree_ops->btree_search_async(key, op, pending_ops, lock_manager, interface_getter, stat_network_reads);
+    if (verbose_level >= 2) {
+        out.output("SEARCH key=%lu - reading root metadata first\n", key);
+    }
+    
+    // Read root metadata with SHARED lock
+    read_root_metadata_async(op);
 }
 
 void ComputeServer::btree_insert_async(uint64_t key, uint64_t value) {
+    // Step 1: Read root metadata to get current root address and tree height
+    // We do NOT cache this locally - always read from memory!
     AsyncOperation op;
-    op.type = AsyncOperation::INSERT;
+    op.type = AsyncOperation::READ_ROOT_METADATA;
+    op.intended_operation_type = AsyncOperation::INSERT;  // Store the actual operation type
     op.key = key;
-    op.value = value;
+    op.value = value;  // Store actual value
     op.current_level = 0;
-    op.current_address = root_address;
     op.start_time = getCurrentSimTime();
     
     if (verbose_level >= 1) {
-        out.output("INSERT key=%lu, value=%lu - starting traversal\n", key, value);
+        out.output("INSERT key=%lu, value=%lu - reading root metadata first\n", key, value);
     }
     
-    auto interface_getter = [this](uint64_t addr) { return get_interface_for_address(addr); };
-    btree_ops->btree_insert_async(key, value, op, pending_ops, lock_manager, interface_getter, stat_network_reads);
+    // Read root metadata with SHARED lock
+    read_root_metadata_async(op);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LOCK PROTOCOL HANDLERS (LL/SC - LoadLink/StoreConditional)
+// ═══════════════════════════════════════════════════════════════════════════
+
+bool ComputeServer::handle_lock_operations(Interfaces::StandardMem::Request* req) {
+    auto req_id = req->getID();
+    
+    // Check if this is a response to one of our pending operations
+    auto op_it = pending_ops.find(req_id);
+    if (op_it == pending_ops.end()) {
+        return false;  // Not a pending operation
+    }
+    
+    AsyncOperation& op = op_it->second;
+    
+    // Try lock acquisition first
+    if (handle_lock_acquisition(req_id, op, req)) {
+        return true;
+    }
+    
+    // Try lock release second
+    if (handle_lock_release(req_id, op, req)) {
+        return true;
+    }
+    
+    return false;  // Not a lock operation
+}
+
+bool ComputeServer::handle_lock_acquisition(
+    SST::Interfaces::StandardMem::Request::id_t req_id,
+    AsyncOperation& op,
+    SST::Interfaces::StandardMem::Request* req) {
+    
+    // Handle LoadLink (Read) responses - step 1 of LL/SC acquisition
+    if (op.waiting_for_loadlink_response) {
+        if (auto* read_resp = dynamic_cast<Interfaces::StandardMem::ReadResp*>(req)) {
+            lock_manager->handle_loadlink_response(req_id, read_resp->data, pending_ops, 
+                                                  get_interface_for_address(op.lock_target_address),
+                                                  get_serialized_node_size());
+            stat_network_reads->addData(1);
+            return true;  // Handled
+        }
+    }
+    
+    // Handle StoreConditional (Write) responses - step 2 of LL/SC acquisition
+    if (op.waiting_for_sc_response) {
+        if (auto* write_resp = dynamic_cast<Interfaces::StandardMem::WriteResp*>(req)) {
+            lock_manager->handle_storeconditional_response(req_id, write_resp, pending_ops, 
+                                                           get_interface_for_address(op.lock_target_address),
+                                                           get_serialized_node_size());
+            stat_network_writes->addData(1);
+            return true;  // Handled
+        }
+    }
+    
+    return false;  // Not a lock acquisition operation
+}
+
+bool ComputeServer::handle_lock_release(
+    SST::Interfaces::StandardMem::Request::id_t req_id,
+    AsyncOperation& op,
+    SST::Interfaces::StandardMem::Request* req) {
+    
+    // Handle LoadLink (Read) responses during lock release
+    if (op.waiting_for_release_ll) {
+        if (auto* read_resp = dynamic_cast<Interfaces::StandardMem::ReadResp*>(req)) {
+            auto interface_getter = [this](uint64_t addr) { return get_interface_for_address(addr); };
+            lock_manager->handle_release_loadlink_response(req_id, read_resp->data, pending_ops, interface_getter);
+            stat_network_reads->addData(1);
+            return true;  // Handled
+        }
+    }
+    
+    // Handle StoreConditional (Write) responses during lock release
+    if (op.waiting_for_release_sc) {
+        if (auto* write_resp = dynamic_cast<Interfaces::StandardMem::WriteResp*>(req)) {
+            auto interface_getter = [this](uint64_t addr) { return get_interface_for_address(addr); };
+            lock_manager->handle_release_storeconditional_response(req_id, write_resp, pending_ops, 
+                                                                   interface_getter, RESTART_SIGNAL_ADDRESS);
+            stat_network_writes->addData(1);
+            
+            // Check if operation can complete now (all locks released)
+            if (pending_ops.count(req_id) && lock_manager->is_operation_complete(pending_ops[req_id])) {
+                auto& completed_op = pending_ops[req_id];
+                // Record latency and completion
+                SimTime_t latency = getCurrentSimTime() - completed_op.start_time;
+                stat_total_latency->addData(latency);
+                stat_ops_completed->addData(1);
+                
+                // Remove from pending operations
+                pending_ops.erase(req_id);
+            }
+            return true;  // Handled
+        }
+    }
+    
+    return false;  // Not a lock release operation
 }
 
 void ComputeServer::handle_read_response(Interfaces::StandardMem::Request::id_t req_id,
@@ -346,47 +530,14 @@ void ComputeServer::handle_read_response(Interfaces::StandardMem::Request::id_t 
     
     auto& op = pending_ops[req_id];
     
-    // Handle validity bit check response (for non-initializing nodes)
-    if (checking_validity_bit && !tree_initialized) {
-        checking_validity_bit = false;
-        uint8_t validity_bit = data[0];
-        
-        if (validity_bit == 1) {
-            out.output("Node %d: Validity bit is 1, tree is ready!\n", node_id);
-            tree_initialized = true;
-        } else {
-            out.output("Node %d: Validity bit is 0, tree not ready yet, will retry\n", node_id);
-            // Will check again in next tick
-        }
-        
-        pending_ops.erase(req_id);
-        return;
-    }
-    
-    // Handle LoadLink responses (lock acquisition - step 1 of LL/SC protocol)
-    if (op.waiting_for_loadlink_response) {
-        lock_manager->handle_loadlink_response(req_id, data, pending_ops, 
-                                              get_interface_for_address(op.lock_target_address),
-                                              get_serialized_node_size());
-        stat_network_reads->addData(1);
-        return;
-    }
-    
-    // Handle LoadLink responses during lock release
-    if (op.waiting_for_release_ll) {
-        auto interface_getter = [this](uint64_t addr) { return get_interface_for_address(addr); };
-        lock_manager->handle_release_loadlink_response(req_id, data, pending_ops, interface_getter);
-        stat_network_reads->addData(1);
-        return;
-    }
-    
     // Deserialize the node we just read
     BTreeNode node = serializer->deserialize(data);
     node.node_address = op.current_address;
     op.path.push_back(node);
     
     // Check if we've reached a leaf node
-    bool at_leaf = (node.is_leaf || op.current_level >= tree_height - 1);
+    // NOTE: tree_height is stored in op.tree_height (read from metadata at operation start)
+    bool at_leaf = (node.is_leaf || op.current_level >= op.tree_height - 1);
     
     if (!at_leaf) {
         // Internal node - continue traversal
@@ -411,119 +562,141 @@ void ComputeServer::handle_write_response(Interfaces::StandardMem::Request::id_t
     
     auto& op = pending_ops[req_id];
     
-    // Handle StoreConditional responses (lock acquisition - step 2 of LL/SC protocol)
-    if (op.waiting_for_sc_response) {
-        lock_manager->handle_storeconditional_response(req_id, resp, pending_ops, 
-                                                       get_interface_for_address(op.lock_target_address),
-                                                       get_serialized_node_size());
-        stat_network_writes->addData(1);
-        return;
-    }
-    
-    // Handle StoreConditional responses during lock release
-    if (op.waiting_for_release_sc) {
-        auto interface_getter = [this](uint64_t addr) { return get_interface_for_address(addr); };
-        lock_manager->handle_release_storeconditional_response(req_id, resp, pending_ops, interface_getter);
-        stat_network_writes->addData(1);
+    if (op.waiting_for_write) {
+        // Check if this is part of a split operation
+        if (op.split_phase == AsyncOperation::WRITE_OLD_NODE || 
+            op.split_phase == AsyncOperation::WRITE_NEW_NODE) {
+            handle_split_write_response(req_id, op);
+            return;
+        }
         
-        // Check if operation can complete now (all locks released)
-        if (pending_ops.count(req_id) && lock_manager->is_operation_complete(pending_ops[req_id])) {
-            auto& completed_op = pending_ops[req_id];
+        // Check if this is a root split operation
+        if (op.is_root_split || op.current_address == ROOT_METADATA_ADDRESS) {
+            handle_root_split_write_response(req_id, op);
+            return;
+        }
+        
+        // Simple write (no split) or final write - complete the operation
+        handle_simple_write_completion(req_id, op);
+    }
+}
+
+void ComputeServer::handle_split_write_response(
+    SST::Interfaces::StandardMem::Request::id_t req_id,
+    AsyncOperation& op) {
+    
+    if (op.split_phase == AsyncOperation::WRITE_OLD_NODE) {
+        // Left leaf written, now write right leaf
+        if (verbose_level >= 2) {
+            out.output("      Left leaf write complete, writing right leaf...\n");
+        }
+        
+        op.split_phase = AsyncOperation::WRITE_NEW_NODE;
+        op.waiting_for_write = false;
+        write_split_nodes(req_id, op);
+        
+    } else if (op.split_phase == AsyncOperation::WRITE_NEW_NODE) {
+        // Both leaves written, now need to update parent
+        if (verbose_level >= 1) {
+            out.output("   SPLIT: Both leaves written, updating parent with separator=%lu\n",
+                      op.separator_key);
+        }
+        
+        // Phase 4: Update parent with separator key
+        op.split_phase = AsyncOperation::UPDATE_PARENT_NODE;
+        op.waiting_for_write = false;
+        update_parent_after_split(req_id, op);
+    }
+}
+
+void ComputeServer::handle_root_split_write_response(
+    SST::Interfaces::StandardMem::Request::id_t req_id,
+    AsyncOperation& op) {
+    
+    // Check if this was a root metadata update (after root split)
+    // Only operations writing to ROOT_METADATA_ADDRESS are metadata updates
+    if (op.current_address == ROOT_METADATA_ADDRESS) {
+        if (verbose_level >= 1) {
+            out.output("   SPLIT: Root metadata update complete (root=0x%lx, height=%u)\n",
+                      op.parent_address, op.tree_height);
+            out.output("   INSERT key=%lu - root split with metadata update finished\n", op.key);
+        }
+        
+        stat_inserts->addData(1);
+        
+        // Mark operation as ready to complete
+        op.ready_to_complete = true;
+        op.waiting_for_write = false;
+        
+        // Release all locks held during operation (async with LL/SC)
+        auto interface_getter = [this](uint64_t addr) { return get_interface_for_address(addr); };
+        lock_manager->release_all_locks(req_id, op, interface_getter, pending_ops);
+        
+        // Check if operation can complete immediately (no locks to release)
+        if (lock_manager->is_operation_complete(op)) {
             // Record latency and completion
-            SimTime_t latency = getCurrentSimTime() - completed_op.start_time;
+            SimTime_t latency = getCurrentSimTime() - op.start_time;
             stat_total_latency->addData(latency);
-            stat_ops_completed->addData(1);
             
-            // Remove from pending operations
+            if (verbose_level >= 1) {
+                out.output("   INSERT key=%lu COMPLETE (latency: %lu cycles)\n", op.key, latency);
+            }
+            
             pending_ops.erase(req_id);
         }
         return;
     }
     
-    // Handle initialization write completion
-    if (op.type == AsyncOperation::INIT_WRITE) {
-        out.output("Node %d: Root node write complete, setting validity_bit=1\n", node_id);
+    // Check if this was a root split (new root node write, before metadata update)
+    if (op.is_root_split) {
+        if (verbose_level >= 1) {
+            out.output("   SPLIT: Root split complete, updating tree metadata\n");
+        }
         
-        // Step 3: Write validity_bit = 1 (tree is now ready)
-        std::vector<uint8_t> valid_bit = {1};
-        auto validity_req = new SST::Interfaces::StandardMem::Write(VALIDITY_BIT_ADDRESS, 1, valid_bit);
-        SST::Interfaces::StandardMem* validity_interface = get_interface_for_address(VALIDITY_BIT_ADDRESS);
-        validity_interface->send(validity_req);
+        // Update root metadata at MEMORY_BASE_ADDRESS
+        // New root address is stored in op.parent_address
+        // New tree height is stored in op.tree_height
+        update_root_metadata_async(req_id, op, op.parent_address, op.tree_height);
         
-        out.output("Node %d: B+tree initialization complete, validity_bit=1, tree ready\n", node_id);
-        tree_initialized = true;
-        pending_ops.erase(req_id);
-        return;
+        if (verbose_level >= 1) {
+            out.output("   New root: 0x%lx, Tree height: %u (updating metadata)\n", 
+                      op.parent_address, op.tree_height);
+        }
+        
+        // NOTE: We do NOT mark ready_to_complete here yet!
+        // The metadata update will complete the operation when done
+        return;  // Exit here, metadata update will continue
+    }
+}
+
+void ComputeServer::handle_simple_write_completion(
+    SST::Interfaces::StandardMem::Request::id_t req_id,
+    AsyncOperation& op) {
+    
+    if (verbose_level >= 1) {
+        out.output("   INSERT key=%lu - write complete, operation finished\n", op.key);
     }
     
-    if (op.waiting_for_write) {
-        // Check if this is part of a split operation
-        if (op.split_phase == AsyncOperation::WRITE_OLD_NODE) {
-            // Left leaf written, now write right leaf
-            if (verbose_level >= 2) {
-                out.output("      Left leaf write complete, writing right leaf...\n");
-            }
-            
-            op.split_phase = AsyncOperation::WRITE_NEW_NODE;
-            op.waiting_for_write = false;
-            write_split_nodes(req_id, op);
-            
-        } else if (op.split_phase == AsyncOperation::WRITE_NEW_NODE) {
-            // Both leaves written, now need to update parent
-            if (verbose_level >= 1) {
-                out.output("   SPLIT: Both leaves written, updating parent with separator=%lu\n",
-                          op.separator_key);
-            }
-            
-            // Phase 4: Update parent with separator key
-            op.split_phase = AsyncOperation::UPDATE_PARENT_NODE;
-            op.waiting_for_write = false;
-            update_parent_after_split(req_id, op);
-            
-        } else {
-            // Simple write (no split) or final write - finish the insert operation
-            
-            // Check if this was a root split
-            if (op.is_root_split) {
-                if (verbose_level >= 1) {
-                    out.output("   SPLIT: Root split complete, updating tree metadata\n");
-                }
-                
-                // Update root address and tree height
-                root_address = op.parent_address;
-                tree_height++;
-                
-                if (verbose_level >= 1) {
-                    out.output("   New root: 0x%lx, Tree height: %u\n", root_address, tree_height);
-                }
-            }
-            
-            if (verbose_level >= 1) {
-                out.output("   INSERT key=%lu - write complete, operation finished\n", op.key);
-            }
-            
-            stat_inserts->addData(1);
-            
-            // Mark operation as ready to complete
-            op.ready_to_complete = true;
-            
-            // Release all locks held during operation (async with LL/SC)
-            auto interface_getter = [this](uint64_t addr) { return get_interface_for_address(addr); };
-            lock_manager->release_all_locks(req_id, op, interface_getter, pending_ops);
-            
-            // Check if operation can complete immediately (no locks to release)
-            if (lock_manager->is_operation_complete(op)) {
-                // Record latency and completion
-                SimTime_t latency = getCurrentSimTime() - op.start_time;
-                stat_total_latency->addData(latency);
-                stat_ops_completed->addData(1);
-                
-                // Remove from pending operations
-                pending_ops.erase(req_id);
-            }
-            // Otherwise, operation will complete after locks are released
-        }
+    stat_inserts->addData(1);
+    
+    // Mark operation as ready to complete
+    op.ready_to_complete = true;
+    
+    // Release all locks held during operation (async with LL/SC)
+    auto interface_getter = [this](uint64_t addr) { return get_interface_for_address(addr); };
+    lock_manager->release_all_locks(req_id, op, interface_getter, pending_ops);
+    
+    // Check if operation can complete immediately (no locks to release)
+    if (lock_manager->is_operation_complete(op)) {
+        // Record latency and completion
+        SimTime_t latency = getCurrentSimTime() - op.start_time;
+        stat_total_latency->addData(latency);
+        stat_ops_completed->addData(1);
+        
+        // Remove from pending operations
+        pending_ops.erase(req_id);
     }
+    // Otherwise, operation will complete after locks are released
 }
 
 uint64_t ComputeServer::get_child_index_for_key(const BTreeNode& node, uint64_t key) {
@@ -656,12 +829,34 @@ void ComputeServer::handle_leaf_insert(
     if (node.num_keys >= btree_fanout - 1) {
         // Node is full - needs split
         if (verbose_level >= 1) {
-            out.output("   INSERT key=%lu - leaf FULL, initiating split\n", op.key);
+            out.output("   INSERT key=%lu - leaf FULL, needs split\n", op.key);
         }
         
-        // Phase 3: Split the leaf
+        // Check if we're in optimistic mode (holding only shared locks on path)
+        if (!op.pessimistic_mode) {
+            // We need to split but only have shared locks on the PATH (not leaf)!
+            // Leaf has exclusive lock (acquired preemptively), but path has shared locks
+            // Must restart with exclusive locks on entire path
+            if (verbose_level >= 1) {
+                out.output("   ⚠️  OPTIMISTIC MODE failed - restarting with EXCLUSIVE locks on path\n");
+            }
+            restart_insert_with_exclusive_locks(req_id, op);
+            return;
+        }
+        
+        // Already in pessimistic mode with exclusive locks on entire path - proceed with split
+        if (verbose_level >= 1) {
+            out.output("   PESSIMISTIC MODE - proceeding with split\n");
+        }
         handle_leaf_split(req_id, op, node);
         return;
+    }
+    
+    // Phase 2: Leaf is safe for insert - has space
+    // We have exclusive lock on leaf (acquired preemptively in optimistic mode)
+    if (verbose_level >= 2) {
+        out.output("   ✅ Leaf is SAFE for insert (has space: %u/%u keys, have EXCLUSIVE lock)\n",
+                  node.num_keys, btree_fanout - 1);
     }
     
     // Phase 2: Insert key/value into leaf in sorted order
@@ -676,10 +871,75 @@ void ComputeServer::handle_leaf_insert(
     write_leaf_and_complete(req_id, op, node);
 }
 
+void ComputeServer::restart_insert_with_exclusive_locks(
+    SST::Interfaces::StandardMem::Request::id_t req_id,
+    AsyncOperation& op) {
+    
+    if (verbose_level >= 1) {
+        out.output("\n🔄 RESTART INSERT with PESSIMISTIC locking: key=%lu, value=%lu\n", 
+                  op.key, op.value);
+    }
+    
+    // Mark operation for restart AFTER lock release completes
+    // Store restart parameters in the operation
+    op.type = AsyncOperation::RESTART_SIGNAL;
+    op.restart_pending = true;
+    op.restart_key = op.key;
+    op.restart_value = op.value;
+    op.restart_start_time = op.start_time;
+    
+    if (verbose_level >= 2) {
+        out.output("   Will restart after releasing %zu held locks\n", op.held_locks.size());
+    }
+    
+    // Release all locks acquired during optimistic traversal
+    // When release completes, the operation will have ready_to_complete=true
+    // and we'll trigger a write to RESTART_SIGNAL_ADDRESS to invoke the restart handler
+    auto interface_getter = [this](uint64_t addr) { return get_interface_for_address(addr); };
+    lock_manager->release_all_locks(req_id, op, interface_getter, pending_ops);
+    
+    // Note: Lock release is async. When complete, the operation will still be in pending_ops.
+    // We need to detect this in a response handler and trigger the restart.
+}
+
+void ComputeServer::handle_restart_after_lock_release(
+    SST::Interfaces::StandardMem::Request::id_t req_id,
+    AsyncOperation& op) {
+    
+    if (verbose_level >= 2) {
+        out.output("   🔄 RESTART triggered: Starting new pessimistic INSERT for key=%lu\n", op.restart_key);
+    }
+    
+    // Create new operation starting from root metadata read with PESSIMISTIC mode
+    // We need to re-read metadata since root may have changed during our operation
+    AsyncOperation new_op;
+    new_op.type = AsyncOperation::READ_ROOT_METADATA;  // Start with metadata read
+    new_op.intended_operation_type = AsyncOperation::INSERT;  // This will be an INSERT operation
+    new_op.key = op.restart_key;
+    new_op.value = op.restart_value;
+    new_op.current_level = 0;
+    new_op.start_time = op.restart_start_time;      // Keep original timestamp for latency tracking
+    new_op.restart_start_time = op.restart_start_time;  // ← CRITICAL: Mark this as a restarted operation!
+    new_op.pessimistic_mode = true;                 // ← KEY: This forces exclusive locks!
+    
+    if (verbose_level >= 2) {
+        out.output("   Restarting from root metadata read with EXCLUSIVE locks (pessimistic mode)\n");
+    }
+    
+    // Erase the old RESTART_SIGNAL operation
+    pending_ops.erase(req_id);
+    
+    // Read root metadata again (root may have changed)
+    read_root_metadata_async(new_op);
+}
+
+
 void ComputeServer::insert_into_leaf(BTreeNode& leaf, uint64_t key, uint64_t value) {
     // Validate assumptions
     assert(leaf.is_leaf && "insert_into_leaf called on non-leaf node");
-    assert(leaf.num_keys < btree_fanout - 1 && "insert_into_leaf called on full leaf");
+    // Note: We allow insertion into full leaves (num_keys == btree_fanout - 1) because
+    // handle_leaf_split() temporarily inserts into a full node to determine split point
+    assert(leaf.num_keys <= btree_fanout - 1 && "insert_into_leaf called on overfull leaf");
     
     // Find insertion position (keys are sorted)
     uint32_t insert_pos = 0;
@@ -711,7 +971,9 @@ void ComputeServer::insert_into_leaf(BTreeNode& leaf, uint64_t key, uint64_t val
 void ComputeServer::insert_into_internal_node(BTreeNode& internal, uint64_t key, uint64_t right_child) {
     // Validate assumptions
     assert(!internal.is_leaf && "insert_into_internal_node called on leaf node");
-    assert(internal.num_keys < btree_fanout - 1 && "insert_into_internal_node called on full node");
+    // Note: We allow insertion into full nodes (num_keys == btree_fanout - 1) because
+    // handle_internal_split() temporarily inserts into a full node to determine split point
+    assert(internal.num_keys <= btree_fanout - 1 && "insert_into_internal_node called on overfull node");
     
     if (verbose_level >= 2) {
         out.output("      Inserting separator key=%lu into internal node 0x%lx\n",
@@ -787,7 +1049,14 @@ void ComputeServer::handle_internal_split(
     
     // Redistribute keys and children
     // Left gets: keys[0..mid-1], children[0..mid]
+    // Note: keys[mid] is the promoted key that goes to parent (not stored in left or right)
     left_internal.num_keys = mid;
+    for (uint32_t i = 0; i < mid; i++) {
+        left_internal.keys[i] = temp_node.keys[i];
+    }
+    for (uint32_t i = 0; i <= mid; i++) {
+        left_internal.children[i] = temp_node.children[i];
+    }
     
     // Right gets: keys[mid+1..n], children[mid+1..n+1]
     for (uint32_t i = mid + 1; i < temp_node.num_keys; i++) {
@@ -798,12 +1067,6 @@ void ComputeServer::handle_internal_split(
     // Copy children to right node (children[mid+1] onwards)
     for (uint32_t i = 0; i <= right_internal.num_keys; i++) {
         right_internal.children[i] = temp_node.children[mid + 1 + i];
-    }
-    
-    // Update left node's children (keep only children[0..mid])
-    // (keys already correct from temp_node copy)
-    for (uint32_t i = 0; i <= left_internal.num_keys; i++) {
-        left_internal.children[i] = temp_node.children[i];
     }
     
     if (verbose_level >= 1) {
@@ -825,9 +1088,12 @@ void ComputeServer::handle_root_split(
     SST::Interfaces::StandardMem::Request::id_t req_id,
     AsyncOperation& op) {
     
+    // Calculate new tree height
+    uint32_t new_tree_height = op.tree_height + 1;
+    
     if (verbose_level >= 1) {
         out.output("   SPLIT: Creating new root, tree height %u -> %u\n",
-                  tree_height, tree_height + 1);
+                  op.tree_height, new_tree_height);
     }
     
     // Create new root node (internal node)
@@ -863,8 +1129,10 @@ void ComputeServer::handle_root_split(
     pending_ops[write_id].is_root_split = true;
     pending_ops[write_id].split_phase = AsyncOperation::NONE;
     
-    // Store new root address temporarily in operation
+    // Store new root address and height temporarily in operation
+    // These will be written to ROOT_METADATA_ADDRESS after the new root node write completes
     pending_ops[write_id].parent_address = new_root_address;
+    pending_ops[write_id].tree_height = new_tree_height;  // Store new height
     
     SST::Interfaces::StandardMem* interface = get_interface_for_address(new_root_address);
     interface->send(write_req);
@@ -921,8 +1189,14 @@ void ComputeServer::handle_leaf_split(
                   node.node_address, node.num_keys);
     }
     
-    // Calculate split point (middle)
-    uint32_t split_point = (btree_fanout - 1) / 2;  // Left gets smaller half if odd
+    // First, insert the new key into a temporary copy to get balanced split
+    // This is better than: split then insert, which can lead to imbalanced nodes
+    BTreeNode temp_node = node;
+    insert_into_leaf(temp_node, op.key, op.value);
+    
+    // Now split the temporary node (which has fanout keys after insertion)
+    // Calculate split point (middle) - this gives us a balanced split
+    uint32_t split_point = temp_node.num_keys / 2;  // Left gets smaller half if odd
     
     // Create right sibling leaf (new node)
     next_node_id++;  // Increment node counter
@@ -936,19 +1210,24 @@ void ComputeServer::handle_leaf_split(
     BTreeNode& left_leaf = node;
     
     if (verbose_level >= 2) {
-        out.output("      Split point: %u, left will have %u keys, right will have %u keys\n",
-                  split_point, split_point, (node.num_keys - split_point));
+        out.output("      Split point: %u (after inserting new key), left will have %u keys, right will have %u keys\n",
+                  split_point, split_point, (temp_node.num_keys - split_point));
     }
     
-    // Move upper half of keys to right sibling
-    for (uint32_t i = split_point; i < node.num_keys; i++) {
-        right_leaf.keys[right_leaf.num_keys] = left_leaf.keys[i];
-        right_leaf.values[right_leaf.num_keys] = left_leaf.values[i];
+    // Redistribute keys from temp_node
+    // Left gets: keys[0..split_point-1]
+    left_leaf.num_keys = split_point;
+    for (uint32_t i = 0; i < split_point; i++) {
+        left_leaf.keys[i] = temp_node.keys[i];
+        left_leaf.values[i] = temp_node.values[i];
+    }
+    
+    // Right gets: keys[split_point..n]
+    for (uint32_t i = split_point; i < temp_node.num_keys; i++) {
+        right_leaf.keys[right_leaf.num_keys] = temp_node.keys[i];
+        right_leaf.values[right_leaf.num_keys] = temp_node.values[i];
         right_leaf.num_keys++;
     }
-    
-    // Update left leaf to have only lower half
-    left_leaf.num_keys = split_point;
     
     // Update sibling pointers (leaves form linked list)
     right_leaf.next_leaf = left_leaf.next_leaf;
@@ -958,21 +1237,8 @@ void ComputeServer::handle_leaf_split(
     uint64_t separator_key = right_leaf.keys[0];
     
     if (verbose_level >= 1) {
-        out.output("      Left leaf: %u keys, Right leaf: %u keys, Separator: %lu\n",
+        out.output("      Left leaf: %u keys, Right leaf: %u keys, Separator: %lu (balanced split)\n",
                   left_leaf.num_keys, right_leaf.num_keys, separator_key);
-    }
-    
-    // Now insert the new key into the appropriate leaf
-    if (op.key < separator_key) {
-        if (verbose_level >= 2) {
-            out.output("      Inserting key=%lu into left leaf\n", op.key);
-        }
-        insert_into_leaf(left_leaf, op.key, op.value);
-    } else {
-        if (verbose_level >= 2) {
-            out.output("      Inserting key=%lu into right leaf\n", op.key);
-        }
-        insert_into_leaf(right_leaf, op.key, op.value);
     }
     
     // Store split information in operation for parent update
@@ -1046,9 +1312,14 @@ void ComputeServer::update_parent_after_split(
                   op.separator_key, op.new_node.node_address);
     }
     
-    // Find parent node in the path (one level up from the split node)
-    if (op.path.size() < 2) {
-        // No parent exists - this was a root split!
+    // Remove the split node from path first
+    // Path structure before pop: [..., parent, split_node]  (or just [root] if splitting root)
+    // Path structure after pop:  [..., parent]              (or empty [] if split root)
+    op.path.pop_back();
+    
+    // Check if path is now empty - this means we split the root
+    if (op.path.empty()) {
+        // Root split - after removing the split node, path is empty (no parent exists)
         if (verbose_level >= 1) {
             out.output("   SPLIT: Root node split detected, creating new root\n");
         }
@@ -1058,8 +1329,8 @@ void ComputeServer::update_parent_after_split(
         return;
     }
     
-    // Get parent node (second-to-last in path)
-    BTreeNode& parent = op.path[op.path.size() - 2];
+    // Get parent node (now the last element in path after removing split node)
+    BTreeNode& parent = op.path.back();
     
     if (verbose_level >= 2) {
         out.output("      Parent node 0x%lx has %u keys (max %u)\n",
@@ -1120,7 +1391,23 @@ void ComputeServer::write_leaf_and_complete(
 }
 
 SST::Interfaces::StandardMem* ComputeServer::get_interface_for_address(uint64_t address) {
+    // Calculate which memory server owns this address
+    // Memory layout: Each server owns ADDRESS_SPACE_PER_SERVER bytes
+    //   Server 0: [MEMORY_BASE_ADDRESS, MEMORY_BASE_ADDRESS + ADDRESS_SPACE_PER_SERVER)
+    //   Server 1: [MEMORY_BASE_ADDRESS + ADDRESS_SPACE_PER_SERVER, ...)
+    //   etc.
     uint64_t server_id = GET_MEMORY_SERVER(address);
+    
+    // Validate server_id is within range
+    if (server_id >= memory_interfaces.size()) {
+        out.fatal(CALL_INFO, -1, 
+                 "FATAL: Address 0x%lx maps to memory server %lu, but only %zu servers exist!\n"
+                 "Address space per server: 0x%lx (%lu bytes)\n"
+                 "This indicates an address calculation error.\n",
+                 address, server_id, memory_interfaces.size(),
+                 MemoryServer::ADDRESS_SPACE_PER_SERVER, MemoryServer::ADDRESS_SPACE_PER_SERVER);
+    }
+    
     return memory_interfaces[server_id];
 }
 
@@ -1129,8 +1416,10 @@ uint64_t ComputeServer::allocate_node_address() {
     uint32_t memory_server_id = current_memory_server;
     
     // Calculate how many nodes fit in a chunk
+    // Each node occupies: LOCK_HEADER_SIZE (8 bytes) + serialized node data
     size_t node_size = get_serialized_node_size();
-    uint32_t max_nodes_per_chunk = MemoryServer::CHUNK_SIZE / node_size;
+    size_t total_node_size = LOCK_HEADER_SIZE + node_size;
+    uint32_t max_nodes_per_chunk = MemoryServer::CHUNK_SIZE / total_node_size;
     const uint32_t PREALLOCATE_THRESHOLD = 10;  // Request new chunk when 10 nodes left
     
     // Check if we have any chunks for this memory server
@@ -1149,6 +1438,7 @@ uint64_t ComputeServer::allocate_node_address() {
                  "  2. Chunk allocation failed\n"
                  "  3. Memory server is full\n",
                  memory_server_id);
+        assert(false && "No chunks available for memory server");
     }
     
     // Get the most recent chunk (last in vector)
@@ -1179,6 +1469,7 @@ uint64_t ComputeServer::allocate_node_address() {
                      "FATAL: Next memory server %u has no chunks.\n"
                      "Pre-allocation of next chunk should have happened earlier!\n",
                      memory_server_id);
+            assert(false && "No chunks available for next memory server");
         }
         
         // Use the most recent chunk from new server
@@ -1202,14 +1493,15 @@ uint64_t ComputeServer::allocate_node_address() {
     }
     
     // Allocate from current chunk
-    uint64_t node_address = current_chunk.chunk_address + (current_chunk.nodes_used * node_size);
+    // Each node occupies: LOCK_HEADER_SIZE + node_size
+    uint64_t node_address = current_chunk.chunk_address + (current_chunk.nodes_used * total_node_size);
     current_chunk.nodes_used++;
     next_node_id++;  // Track total nodes allocated (for statistics)
     
     if (verbose_level >= 3) {
-        out.output("✅ Compute %d: Allocated 0x%lx from chunk %u (server %u, %u/%u nodes used)\n",
+        out.output("✅ Compute %d: Allocated 0x%lx from chunk %u (server %u, %u/%u nodes used, node_size=%zu+%d=%zu bytes)\n",
                   node_id, node_address, current_chunk.chunk_id, memory_server_id, 
-                  current_chunk.nodes_used, max_nodes_per_chunk);
+                  current_chunk.nodes_used, max_nodes_per_chunk, node_size, LOCK_HEADER_SIZE, total_node_size);
     }
     
     return node_address;
@@ -1223,7 +1515,7 @@ void ComputeServer::initialize_btree() {
         return;
     }
     
-    out.output("Node %d: Initializing B+tree with validity bit synchronization\n", node_id);
+    out.output("Node %d: Initializing B+tree with root metadata at 0x%llx\n", node_id, (unsigned long long)ROOT_METADATA_ADDRESS);
     
     // Step 1: Write validity_bit = 0 (tree not ready)
     std::vector<uint8_t> invalid_bit = {0};
@@ -1232,32 +1524,37 @@ void ComputeServer::initialize_btree() {
     validity_interface->send(validity_req1);
     out.output("Node %d: Wrote validity_bit=0 (tree not ready)\n", node_id);
     
-    // Step 2: Write the root node  
+    // Step 2: Allocate and write the initial root node
+    // Initial root is a leaf node (tree height = 1)
+    uint64_t initial_root_address = allocate_node_address();
     BTreeNode root(btree_fanout);
     root.is_leaf = true;
     root.num_keys = 0;
-    root.node_address = root_address;
+    root.node_address = initial_root_address;
     
     auto data = serializer->serialize(root);
     
     // IMPORTANT: The lock system reads node data from address + LOCK_HEADER_SIZE (after lock header)
     // So we must write the node data at root_address + LOCK_HEADER_SIZE
     // The first LOCK_HEADER_SIZE bytes (lock header) are initialized to zero by the memory server
-    auto root_req = new SST::Interfaces::StandardMem::Write(root_address + LOCK_HEADER_SIZE, data.size(), data);
+    auto root_req = new SST::Interfaces::StandardMem::Write(initial_root_address + LOCK_HEADER_SIZE, data.size(), data);
     
-    // Track this write request so we know when initialization completes
+    // Track this write request so we know when to write metadata
     AsyncOperation init_op;
     init_op.type = AsyncOperation::INIT_WRITE;
-    init_op.waiting_for_write = false;
+    init_op.waiting_for_write = true;  // Changed to true - we're waiting for this write
+    init_op.parent_address = initial_root_address;  // Store root address for metadata write
+    init_op.tree_height = 1;  // Initial tree height
     pending_ops[root_req->getID()] = init_op;
     
-    SST::Interfaces::StandardMem* target_interface = get_interface_for_address(root_address);
+    SST::Interfaces::StandardMem* target_interface = get_interface_for_address(initial_root_address);
     target_interface->send(root_req);
     
-    out.output("Node %d: Wrote root node at address 0x%lx\n", node_id, root_address);
+    out.output("Node %d: Wrote initial root node at address 0x%lx (height=1)\n", node_id, initial_root_address);
     
-    // Step 3: Write validity_bit = 1 (tree ready) - this will be done in handle_write_response
-    // when we get confirmation that the root node write completed
+    // Step 3: Write root metadata - this will be done in handle_write_response
+    // after the root node write completes
+    // Step 4: Write validity_bit = 1 - this will be done after metadata write completes
 }
 
 void ComputeServer::check_tree_initialization() {
@@ -1283,12 +1580,286 @@ void ComputeServer::check_tree_initialization() {
     checking_validity_bit = true;
 }
 
+void ComputeServer::handle_validity_check_response(
+    SST::Interfaces::StandardMem::Request::id_t req_id,
+    SST::Interfaces::StandardMem::ReadResp* resp) {
+    
+    if (!pending_ops.count(req_id)) {
+        out.output("WARNING: Received validity check response for unknown request ID %lu\n", req_id);
+        return;
+    }
+    
+    checking_validity_bit = false;
+    uint8_t validity_bit = resp->data[0];
+    
+    if (validity_bit == 1) {
+        out.output("Node %d: Validity bit is 1, tree is ready!\n", node_id);
+        tree_initialized = true;
+    } else {
+        out.output("Node %d: Validity bit is 0, tree not ready yet, will retry\n", node_id);
+        // Will check again in next tick
+    }
+    
+    // Remove operation from pending
+    pending_ops.erase(req_id);
+}
+
 void ComputeServer::process_btree_operation(const WorkloadOp& op) {
     if (op.op_type == BTREE_SEARCH) {
         btree_search_async(op.key);
     } else if (op.op_type == BTREE_INSERT) {
         btree_insert_async(op.key, op.value);
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ROOT METADATA MANAGEMENT
+// ═══════════════════════════════════════════════════════════════════════════
+
+std::vector<uint8_t> ComputeServer::serialize_root_metadata(const RootMetadata& metadata) {
+    std::vector<uint8_t> data(16, 0);  // 8 (root_address) + 4 (tree_height) + 4 (reserved)
+    
+    // Serialize root_address (8 bytes)
+    std::memcpy(data.data(), &metadata.root_address, sizeof(uint64_t));
+    
+    // Serialize tree_height (4 bytes)
+    std::memcpy(data.data() + 8, &metadata.tree_height, sizeof(uint32_t));
+    
+    // Serialize reserved (4 bytes) - all zeros
+    std::memcpy(data.data() + 12, &metadata.reserved, sizeof(uint32_t));
+    
+    return data;
+}
+
+ComputeServer::RootMetadata ComputeServer::deserialize_root_metadata(const std::vector<uint8_t>& data) {
+    RootMetadata metadata;
+    
+    if (data.size() < 16) {
+        out.output("ERROR: Root metadata too small: %zu bytes\n", data.size());
+        return metadata;  // Return default
+    }
+    
+    // Debug: print first 16 bytes of data
+    if (verbose_level >= 2) {
+        out.output("DEBUG: First 16 bytes of metadata: ");
+        for (size_t i = 0; i < std::min(size_t(16), data.size()); i++) {
+            out.output("%02x ", data[i]);
+        }
+        out.output("\n");
+    }
+    
+    // Deserialize root_address (8 bytes)
+    std::memcpy(&metadata.root_address, data.data(), sizeof(uint64_t));
+    
+    // Deserialize tree_height (4 bytes)
+    std::memcpy(&metadata.tree_height, data.data() + 8, sizeof(uint32_t));
+    
+    // Deserialize reserved (4 bytes)
+    std::memcpy(&metadata.reserved, data.data() + 12, sizeof(uint32_t));
+    
+    if (verbose_level >= 3) {
+        out.output("Deserialized root metadata: root=0x%lx, height=%u\n",
+                  metadata.root_address, metadata.tree_height);
+    }
+    
+    return metadata;
+}
+
+void ComputeServer::read_root_metadata_async(AsyncOperation& op) {
+    // Read root metadata with lock (LL/SC protocol)
+    // - SHARED lock for optimistic operations (reads only)
+    // - EXCLUSIVE lock for pessimistic operations (may need to update metadata on root split)
+    
+    if (verbose_level >= 2) {
+        out.output("Reading root metadata from 0x%llx (pessimistic_mode=%d)\n", 
+                  (unsigned long long)ROOT_METADATA_ADDRESS, op.pessimistic_mode);
+    }
+    
+    // Use lock manager to acquire lock on metadata
+    // Lock manager will handle the LL/SC protocol
+    op.lock_target_address = ROOT_METADATA_ADDRESS;
+    
+    // CRITICAL: Use EXCLUSIVE lock if in pessimistic mode (operation may split root and update metadata)
+    // Use SHARED lock for optimistic mode (read-only access to metadata)
+    op.need_exclusive_lock = op.pessimistic_mode;  
+    
+    // Get the interface for the root metadata address
+    auto interface = get_interface_for_address(ROOT_METADATA_ADDRESS);
+    
+    // Try to acquire lock on root metadata node (shared or exclusive based on pessimistic_mode)
+    lock_manager->try_acquire_lock_async(op, ROOT_METADATA_ADDRESS, op.pessimistic_mode, interface, pending_ops);
+}
+
+void ComputeServer::handle_root_metadata_response(
+    SST::Interfaces::StandardMem::Request::id_t req_id,
+    const std::vector<uint8_t>& data) {
+    
+    if (!pending_ops.count(req_id)) return;
+    
+    auto& op = pending_ops[req_id];
+    
+    // Deserialize root metadata
+    RootMetadata metadata = deserialize_root_metadata(data);
+    
+    if (verbose_level >= 2) {
+        out.output("Root metadata read: root=0x%lx, height=%u\n",
+                  metadata.root_address, metadata.tree_height);
+    }
+    
+    // Store in operation for use during traversal
+    op.current_address = metadata.root_address;
+    op.current_level = 0;
+    op.tree_height = metadata.tree_height;  // Store tree height in operation
+    
+    // Set the real operation type from intended_operation_type
+    op.type = op.intended_operation_type;
+    
+    // Note: pessimistic_mode is already set correctly:
+    // - false for new operations (default from constructor)
+    // - true for restarted operations (set in handle_restart_after_lock_release)
+    
+    if (verbose_level >= 2) {
+        out.output("DEBUG: After metadata read - type=%s, pessimistic_mode=%d\n",
+                  (op.type == AsyncOperation::SEARCH) ? "SEARCH" : "INSERT",
+                  op.pessimistic_mode);
+    }
+    
+    // Continue with the actual B+tree operation
+    // Delegate to btree_ops which will continue traversal
+    auto interface_getter = [this](uint64_t addr) { return get_interface_for_address(addr); };
+    
+    if (op.type == AsyncOperation::SEARCH) {
+        btree_ops->btree_search_async(op.key, op, pending_ops, lock_manager, interface_getter, stat_network_reads);
+    } else if (op.type == AsyncOperation::INSERT) {
+        btree_ops->btree_insert_async(op.key, op.value, op, pending_ops, lock_manager, interface_getter, stat_network_reads);
+    }
+    
+    // Remove the metadata read operation (new operation created above)
+    pending_ops.erase(req_id);
+}
+
+void ComputeServer::handle_btree_initialization_write(
+    SST::Interfaces::StandardMem::Request::id_t req_id,
+    AsyncOperation& op) {
+    
+    // Check if this is the root node write or metadata write
+    if (op.current_address == ROOT_METADATA_ADDRESS) {
+        // Step 4: Metadata write complete - set validity bit
+        out.output("Node %d: Root metadata write complete, setting validity_bit=1\n", node_id);
+        
+        std::vector<uint8_t> valid_bit = {1};
+        auto validity_req = new SST::Interfaces::StandardMem::Write(VALIDITY_BIT_ADDRESS, 1, valid_bit);
+        SST::Interfaces::StandardMem* validity_interface = get_interface_for_address(VALIDITY_BIT_ADDRESS);
+        validity_interface->send(validity_req);
+        
+        out.output("Node %d: B+tree initialization complete, validity_bit=1, tree ready\n", node_id);
+        tree_initialized = true;
+        pending_ops.erase(req_id);
+        
+    } else {
+        // Step 3: Root node write complete - write metadata
+        out.output("Node %d: Root node write complete, writing root metadata\n", node_id);
+        
+        RootMetadata initial_metadata;
+        initial_metadata.root_address = op.parent_address;  // Stored from initialize_btree()
+        initial_metadata.tree_height = op.tree_height;      // Stored from initialize_btree()
+        initial_metadata.reserved = 0;
+        
+        auto metadata_data = serialize_root_metadata(initial_metadata);
+        
+        // Pad metadata to full node size (get_serialized_node_size())
+        // This ensures the memory block has the expected size when read back
+        size_t full_node_size = get_serialized_node_size();
+        if (metadata_data.size() < full_node_size) {
+            metadata_data.resize(full_node_size, 0);  // Pad with zeros
+        }
+        
+        // Debug: print what we're writing
+        if (verbose_level >= 2) {
+            out.output("DEBUG: Writing metadata: root=0x%lx, height=%u, padded to %zu bytes\n",
+                      initial_metadata.root_address, initial_metadata.tree_height, metadata_data.size());
+            out.output("       First 16 bytes: ");
+            for (size_t i = 0; i < std::min(size_t(16), metadata_data.size()); i++) {
+                out.output("%02x ", metadata_data[i]);
+            }
+            out.output("\n");
+        }
+        
+        auto metadata_req = new SST::Interfaces::StandardMem::Write(
+            ROOT_METADATA_ADDRESS + LOCK_HEADER_SIZE,
+            metadata_data.size(),
+            metadata_data
+        );
+        
+        // Track this write - we'll set validity bit after metadata is written
+        AsyncOperation metadata_op;
+        metadata_op.type = AsyncOperation::INIT_WRITE;
+        metadata_op.waiting_for_write = true;
+        metadata_op.current_address = ROOT_METADATA_ADDRESS;  // Mark as metadata write
+        pending_ops[metadata_req->getID()] = metadata_op;
+        
+        SST::Interfaces::StandardMem* metadata_interface = get_interface_for_address(ROOT_METADATA_ADDRESS);
+        metadata_interface->send(metadata_req);
+        stat_network_writes->addData(1);
+        
+        out.output("Node %d: Wrote root metadata (root=0x%lx, height=%u)\n", 
+                  node_id, initial_metadata.root_address, initial_metadata.tree_height);
+        
+        pending_ops.erase(req_id);
+    }
+}
+
+void ComputeServer::update_root_metadata_async(
+    SST::Interfaces::StandardMem::Request::id_t req_id,
+    AsyncOperation& op,
+    uint64_t new_root_address,
+    uint32_t new_tree_height) {
+    
+    // Update root metadata with EXCLUSIVE lock (LL/SC protocol)
+    // This is called during root splits
+    
+    if (verbose_level >= 1) {
+        out.output("Updating root metadata: new_root=0x%lx, new_height=%u\n",
+                  new_root_address, new_tree_height);
+    }
+    
+    // Create new metadata
+    RootMetadata new_metadata;
+    new_metadata.root_address = new_root_address;
+    new_metadata.tree_height = new_tree_height;
+    
+    // Serialize metadata
+    auto metadata_data = serialize_root_metadata(new_metadata);
+    
+    // Pad metadata to full node size for consistency
+    size_t full_node_size = get_serialized_node_size();
+    if (metadata_data.size() < full_node_size) {
+        metadata_data.resize(full_node_size, 0);  // Pad with zeros
+    }
+    
+    // Write to root metadata address (after lock header)
+    auto write_req = new SST::Interfaces::StandardMem::Write(
+        ROOT_METADATA_ADDRESS + LOCK_HEADER_SIZE,
+        metadata_data.size(),
+        metadata_data
+    );
+    
+    SST::Interfaces::StandardMem::Request::id_t write_id = write_req->getID();
+    pending_ops[write_id] = op;
+    pending_ops[write_id].waiting_for_write = true;
+    // Mark this as a metadata write (only operations with this address are metadata updates)
+    pending_ops[write_id].current_address = ROOT_METADATA_ADDRESS;
+    
+    SST::Interfaces::StandardMem* interface = get_interface_for_address(ROOT_METADATA_ADDRESS);
+    interface->send(write_req);
+    stat_network_writes->addData(1);
+    
+    if (verbose_level >= 2) {
+        out.output("Sent root metadata update request\n");
+    }
+    
+    // Remove old operation
+    pending_ops.erase(req_id);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1372,10 +1943,9 @@ void ComputeServer::handle_chunk_allocation_response(
     } else {
         // Success! Extract chunk address from response
         uint64_t chunk_address = 0;
-        if (resp->data.size() >= 12) {
-            memcpy(&chunk_address, resp->data.data() + 4, sizeof(uint64_t));
-        }
-        
+        assert(resp->data.size() == 12 && "Chunk allocation response too small for address");
+        memcpy(&chunk_address, resp->data.data() + 4, sizeof(uint64_t));
+
         out.output("✅ Compute %d: Chunk allocation SUCCESS\n", node_id);
         out.output("   chunk_id=%u, address=0x%lx\n", chunk_id, chunk_address);
         

@@ -23,15 +23,16 @@ MemoryServer::MemoryServer(ComponentId_t id, Params& params) :
     // Parse configuration parameters
     memory_server_id = params.find<uint32_t>("memory_server_id", 0);
     num_compute_nodes = params.find<uint32_t>("num_compute_nodes", 8);
-    memory_capacity = params.find<uint64_t>("memory_capacity_gb", 16) * 1024 * 1024 * 1024; // Convert to bytes
-    memory_latency = params.find<SimTime_t>("memory_latency_ns", 100);
-    btree_node_size = params.find<size_t>("btree_node_size", 4096);
     verbose_level = params.find<int>("verbose", 0);
 
     // Calculate base address for this memory server
-    // Address space per server = 64KB (metadata) + (CHUNKS_PER_SERVER * CHUNK_SIZE)
-    uint64_t address_space_per_server = 0x10000 + (CHUNKS_PER_SERVER * CHUNK_SIZE);
-    base_address = 0x10000000 + memory_server_id * address_space_per_server;
+    // Memory layout per server:
+    //   [0, RESERVED_METADATA_SIZE)        = Reserved metadata space (4KB)
+    //     - ROOT_METADATA (32 bytes) at offset 0 (Memory Server 0 only)
+    //     - VALIDITY_BIT (1 byte) at offset 64 (Memory Server 0 only)
+    //     - Future metadata expansion space
+    //   [RESERVED_METADATA_SIZE, ...)      = Chunk pool (CHUNKS_PER_SERVER * CHUNK_SIZE)
+    base_address = 0x10000000 + memory_server_id * ADDRESS_SPACE_PER_SERVER;
 
     // Setup debug output with maximum verbosity for address visibility
     dbg.init("", 5, 0, (Output::output_location_t)1);  // Force high verbosity
@@ -95,12 +96,13 @@ MemoryServer::MemoryServer(ComponentId_t id, Params& params) :
     chunk_allocated.resize(CHUNKS_PER_SERVER, false);  // All chunks initially free
     next_free_chunk_hint = 0;  // Start searching from chunk 0
     
+    uint64_t chunk_pool_capacity = CHUNKS_PER_SERVER * CHUNK_SIZE;
+    
     out.output("Memory Server %d initialized\n", memory_server_id);
-    out.output("  Capacity: %lu GB, Base address: 0x%lx\n", 
-               memory_capacity / (1024*1024*1024), base_address);
-    out.output("  Chunk allocation: %lu chunks of %lu MB each (%lu GB total)\n",
-               CHUNKS_PER_SERVER, CHUNK_SIZE / (1024*1024), 
-               (CHUNKS_PER_SERVER * CHUNK_SIZE) / (1024*1024*1024));
+    out.output("  Chunk pool capacity: %lu GB, Base address: 0x%lx\n", 
+               chunk_pool_capacity / (1024*1024*1024), base_address);
+    out.output("  Chunk allocation: %lu chunks of %lu MB each\n",
+               CHUNKS_PER_SERVER, CHUNK_SIZE / (1024*1024));
 }
 
 MemoryServer::~MemoryServer() {
@@ -113,24 +115,6 @@ void MemoryServer::init(unsigned int phase) {
     // Initialize all additional interfaces
     for (auto& interface : mem_interfaces) {
         interface->init(phase);
-    }
-    
-    if (phase == 0) {
-        // Initialize some sample B+tree nodes for testing
-        std::vector<uint8_t> sample_node(btree_node_size, 0);
-        
-        // Root node - only initialize on Memory Server 0
-        if (memory_server_id == 0) {
-            store_btree_node(base_address, sample_node);  // Root at memory server 0's base address
-        }
-        
-        // Sample leaf nodes within this server's address space
-        for (int i = 0; i < 10; i++) {
-            uint64_t leaf_addr = base_address + 0x1000 + (i * btree_node_size);  // Offset from base
-            store_btree_node(leaf_addr, sample_node);
-        }
-        
-        out.output("Initialized sample B+tree nodes\n");
     }
 }
 
@@ -152,11 +136,12 @@ void MemoryServer::finish() {
     }
     
     // Output final statistics
+    uint64_t chunk_pool_capacity = CHUNKS_PER_SERVER * CHUNK_SIZE;
     out.output("Memory Server %d completed:\n", memory_server_id);
     out.output("  Remote reads: %lu, Remote writes: %lu\n", 
                stat_network_reads->getCollectionCount(), stat_network_writes->getCollectionCount());
     out.output("  Memory utilization: %lu / %lu bytes (%.2f%%)\n", 
-               memory_used, memory_capacity, (double)memory_used / memory_capacity * 100.0);
+               memory_used, chunk_pool_capacity, (double)memory_used / chunk_pool_capacity * 100.0);
 }
 
 void MemoryServer::handleMemoryEvent(SST::Interfaces::StandardMem::Request* req) {
@@ -529,14 +514,6 @@ void MemoryServer::write_memory(uint64_t address, const std::vector<uint8_t>& da
     update_memory_stats();
 }
 
-void MemoryServer::store_btree_node(uint64_t address, const std::vector<uint8_t>& node_data) {
-    write_memory(address, node_data);
-}
-
-std::vector<uint8_t> MemoryServer::load_btree_node(uint64_t address) {
-    return read_memory(address, btree_node_size);
-}
-
 // ===== CHUNK ALLOCATION METHODS =====
 
 int32_t MemoryServer::allocate_chunk() {
@@ -587,18 +564,23 @@ void MemoryServer::free_chunk(uint32_t chunk_id) {
 
 uint64_t MemoryServer::chunk_id_to_address(uint32_t chunk_id) {
     // Calculate base address of chunk within this memory server's address space
-    // Start chunks at offset 0x10000 (64KB) from base to leave room for root and metadata
-    uint64_t chunk_pool_base = base_address + 0x10000;
+    // Chunks start at base_address + RESERVED_METADATA_SIZE
+    // Reserved metadata space (4KB) includes:
+    //   - ROOT_METADATA (32 bytes at offset 0) - Memory Server 0 only
+    //   - VALIDITY_BIT (1 byte at offset 64) - Memory Server 0 only
+    //   - Future metadata expansion space
+    uint64_t chunk_pool_base = base_address + RESERVED_METADATA_SIZE;
     return chunk_pool_base + (chunk_id * CHUNK_SIZE);
 }
 
 bool MemoryServer::is_address_in_range(uint64_t address) {
     // Check if address is within this memory server's allocated range
-    // Range = base_address to (base_address + chunk_pool + all chunks)
-    // chunk_pool starts at base_address + 0x10000 (64KB for root/metadata)
-    // total range = 64KB metadata + (CHUNKS_PER_SERVER * CHUNK_SIZE)
+    // Range layout:
+    //   [base_address, base_address + RESERVED_METADATA_SIZE) = Reserved metadata (4KB)
+    //   [base_address + RESERVED_METADATA_SIZE, ...) = Chunk pool (CHUNKS_PER_SERVER * CHUNK_SIZE)
+    // Total range = ADDRESS_SPACE_PER_SERVER
     uint64_t range_start = base_address;
-    uint64_t range_end = base_address + 0x10000 + (CHUNKS_PER_SERVER * CHUNK_SIZE);
+    uint64_t range_end = base_address + ADDRESS_SPACE_PER_SERVER;
     
     bool in_range = (address >= range_start) && (address < range_end);
     
@@ -612,8 +594,9 @@ bool MemoryServer::is_address_in_range(uint64_t address) {
 }
 
 void MemoryServer::update_memory_stats() {
-    if (memory_capacity > 0) {
-        uint64_t utilization = (memory_used * 100) / memory_capacity;
+    uint64_t chunk_pool_capacity = CHUNKS_PER_SERVER * CHUNK_SIZE;
+    if (chunk_pool_capacity > 0) {
+        uint64_t utilization = (memory_used * 100) / chunk_pool_capacity;
         stat_memory_utilization->addData(utilization);
     }
 }

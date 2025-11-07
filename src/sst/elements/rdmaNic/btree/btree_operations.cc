@@ -15,8 +15,10 @@
 namespace SST {
 namespace MemHierarchy {
 
-BTreeOperations::BTreeOperations(uint64_t& root_addr, uint32_t fanout, int verbose, SST::Output* output)
-    : root_address_(root_addr), btree_fanout_(fanout), verbose_level_(verbose), out_(output) {
+BTreeOperations::BTreeOperations(uint32_t fanout, int verbose, SST::Output* output)
+    : btree_fanout_(fanout), verbose_level_(verbose), out_(output) {
+    // NOTE: root_address and tree_height are NO LONGER stored locally!
+    // They are read from ROOT_METADATA_ADDRESS at the start of each operation.
 }
 
 void BTreeOperations::btree_insert_async(
@@ -29,21 +31,39 @@ void BTreeOperations::btree_insert_async(
     SST::Statistics::Statistic<uint64_t>* stat_reads) {
     
     if (verbose_level_ >= 1 && out_) {
-        out_->output("\n🔹 INSERT Operation (async): key=%lu, value=%lu\n", key, value);
+        out_->output("\n🔹 btree_insert_async (async): key=%lu, value=%lu\n", key, value);
     }
     
     // Don't modify op.current_level or op.current_address here
     // They are set by the caller (ComputeServer::btree_insert_async for new ops,
     // or handle_btree_traversal for continuation)
     
-    // Acquire EXCLUSIVE lock on the current node (INSERT requires write access)
+    // Optimistic locking: Use shared locks during traversal, exclusive at leaf
+    // If pessimistic_mode is set (after restart), use exclusive locks throughout
+    
+    // Detect if we're about to access a leaf node
+    // op.current_level points to the level we're ABOUT TO access (already incremented)
+    // NOTE: tree_height is stored in op.tree_height (read from metadata at operation start)
+    bool accessing_leaf = (op.current_level >= op.tree_height - 1) || 
+                         (op.current_level == 0 && op.tree_height == 1);
+    
+    bool use_exclusive_lock = op.pessimistic_mode || accessing_leaf;
+    
     if (out_) {
-        out_->output("   Step 1: Acquiring EXCLUSIVE lock on node=0x%lx (level=%u)\n", 
-                    op.current_address, op.current_level);
+        if (op.pessimistic_mode) {
+            out_->output("   Step 1: Acquiring EXCLUSIVE lock on node=0x%lx (level=%u) [PESSIMISTIC MODE]\n", 
+                        op.current_address, op.current_level);
+        } else if (accessing_leaf) {
+            out_->output("   Step 1: Acquiring EXCLUSIVE lock on node=0x%lx (level=%u) [LEAF - need write access]\n", 
+                        op.current_address, op.current_level);
+        } else {
+            out_->output("   Step 1: Acquiring SHARED lock on node=0x%lx (level=%u) [OPTIMISTIC MODE]\n", 
+                        op.current_address, op.current_level);
+        }
     }
     
     SST::Interfaces::StandardMem* interface = interface_getter(op.current_address);
-    lock_manager->try_acquire_lock_async(op, op.current_address, true, interface, pending_ops);
+    lock_manager->try_acquire_lock_async(op, op.current_address, use_exclusive_lock, interface, pending_ops);
     stat_reads->addData(1);
 }
 

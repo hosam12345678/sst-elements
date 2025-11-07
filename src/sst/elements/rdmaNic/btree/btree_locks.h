@@ -142,12 +142,14 @@ public:
      * @param resp WriteResp from SC (contains success/fail flag)
      * @param pending_ops Map of pending operations
      * @param interface_getter Function to get network interface for an address
+     * @param restart_signal_address Address to write to when triggering restart after lock release
      */
     void handle_release_storeconditional_response(
         SST::Interfaces::StandardMem::Request::id_t req_id,
         SST::Interfaces::StandardMem::WriteResp* resp,
         std::map<SST::Interfaces::StandardMem::Request::id_t, AsyncOperation>& pending_ops,
-        std::function<SST::Interfaces::StandardMem*(uint64_t)> interface_getter);
+        std::function<SST::Interfaces::StandardMem*(uint64_t)> interface_getter,
+        uint64_t restart_signal_address);
     
     /**
      * Release a single parent lock during lock crabbing

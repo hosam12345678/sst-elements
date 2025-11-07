@@ -116,9 +116,18 @@ private:
     bool tree_initialized;  // Tracks if B+tree initialization is complete
     bool checking_validity_bit;  // Tracks if we're waiting for validity bit check
 
+    // B+tree Root Metadata (stored in memory, NOT local!)
+    // The ONLY local state is whether we're currently reading metadata
+    // NO local caching of root_address or tree_height - always read from memory!
+    struct RootMetadata {
+        uint64_t root_address;   // Address of current root node
+        uint32_t tree_height;    // Current height of the tree
+        uint32_t reserved;       // Reserved for future use (padding to 16 bytes)
+        
+        RootMetadata() : root_address(0), tree_height(1), reserved(0) {}
+    };
+    
     // B+tree state
-    uint64_t root_address;
-    uint32_t tree_height;                        // Current height of the tree
     uint64_t next_node_id;                       // Counter for allocating node IDs
     std::map<uint64_t, uint64_t> parent_map;     // Maps child_address → parent_address (for split operations)
     
@@ -189,9 +198,35 @@ private:
     // Check if a request is a special operation (chunk allocation, etc.)
     bool handle_special_operation_response(SST::Interfaces::StandardMem::Request* req);
   
+    // ===== ROOT METADATA MANAGEMENT =====
+    // Read root metadata (root pointer + tree height) from memory
+    // Acquires SHARED lock, reads metadata, then releases lock
+    void read_root_metadata_async(AsyncOperation& op);
+    
+    // Handle root metadata read response
+    void handle_root_metadata_response(SST::Interfaces::StandardMem::Request::id_t req_id,
+                                       const std::vector<uint8_t>& data);
+    
+    // Update root metadata (for root splits)
+    // Acquires EXCLUSIVE lock, updates metadata atomically with LL/SC, then releases
+    void update_root_metadata_async(SST::Interfaces::StandardMem::Request::id_t req_id,
+                                    AsyncOperation& op,
+                                    uint64_t new_root_address,
+                                    uint32_t new_tree_height);
+    
+    // Handle B+tree initialization writes (root node, metadata, validity bit)
+    void handle_btree_initialization_write(SST::Interfaces::StandardMem::Request::id_t req_id,
+                                           AsyncOperation& op);
+    
+    // Serialize/deserialize root metadata
+    std::vector<uint8_t> serialize_root_metadata(const RootMetadata& metadata);
+    RootMetadata deserialize_root_metadata(const std::vector<uint8_t>& data);
+  
     // B+tree structure management
     void initialize_btree();
     void check_tree_initialization();  // Check validity bit before starting operations
+    void handle_validity_check_response(SST::Interfaces::StandardMem::Request::id_t req_id,
+                                        SST::Interfaces::StandardMem::ReadResp* resp);
     uint64_t calculate_tree_height(uint64_t num_keys);
     uint64_t get_child_index_for_key(const BTreeNode& node, uint64_t key);
     
@@ -201,6 +236,13 @@ private:
     void handle_write_response(SST::Interfaces::StandardMem::Request::id_t req_id,
                                SST::Interfaces::StandardMem::WriteResp* resp);
     void handle_leaf_operation(AsyncOperation& op, BTreeNode& leaf);
+    
+    // Lock protocol handlers (LL/SC)
+    bool handle_lock_operations(SST::Interfaces::StandardMem::Request* req);
+    bool handle_lock_acquisition(SST::Interfaces::StandardMem::Request::id_t req_id,
+                                 AsyncOperation& op, SST::Interfaces::StandardMem::Request* req);
+    bool handle_lock_release(SST::Interfaces::StandardMem::Request::id_t req_id,
+                            AsyncOperation& op, SST::Interfaces::StandardMem::Request* req);
     
     // B+tree traversal helpers
     void handle_btree_traversal(SST::Interfaces::StandardMem::Request::id_t req_id,
@@ -218,6 +260,12 @@ private:
     void write_leaf_and_complete(SST::Interfaces::StandardMem::Request::id_t req_id,
                                  AsyncOperation& op, BTreeNode& leaf);
     
+    // Optimistic locking protocol
+    void restart_insert_with_exclusive_locks(SST::Interfaces::StandardMem::Request::id_t req_id,
+                                            AsyncOperation& op);
+    void handle_restart_after_lock_release(SST::Interfaces::StandardMem::Request::id_t req_id,
+                                           AsyncOperation& op);
+    
     // Split operation handlers
     void handle_leaf_split(SST::Interfaces::StandardMem::Request::id_t req_id,
                           AsyncOperation& op, BTreeNode& node);
@@ -229,6 +277,14 @@ private:
                           AsyncOperation& op);
     void update_parent_after_split(SST::Interfaces::StandardMem::Request::id_t req_id,
                                    AsyncOperation& op);
+    
+    // Write response handlers (split into modular functions)
+    void handle_split_write_response(SST::Interfaces::StandardMem::Request::id_t req_id,
+                                     AsyncOperation& op);
+    void handle_root_split_write_response(SST::Interfaces::StandardMem::Request::id_t req_id,
+                                          AsyncOperation& op);
+    void handle_simple_write_completion(SST::Interfaces::StandardMem::Request::id_t req_id,
+                                        AsyncOperation& op);
     
     // Internal node modification helpers
     void insert_into_internal_node(BTreeNode& internal, uint64_t key, uint64_t right_child);

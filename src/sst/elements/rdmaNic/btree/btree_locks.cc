@@ -293,15 +293,19 @@ void BTreeLockManager::release_all_locks(
     }
     
     if (verbose_level_ >= 2 && out_) {
-        out_->output("   🔓 Releasing %zu held locks using LL/SC\n", op.held_locks.size());
+        out_->output("   🔓 Releasing %zu held locks using LL/SC (bottom-to-top order)\n", op.held_locks.size());
     }
     
     // Start releasing locks one by one using LL/SC protocol
     // This ensures proper reference count decrement for shared locks
-    op.release_lock_index = 0;
+    // 
+    // IMPORTANT: Release locks in REVERSE order (LIFO - Last In, First Out)
+    // Locks were acquired top-to-bottom (root → leaf), so release bottom-to-top (leaf → root)
+    // This minimizes contention: leaf locks are released first, allowing other operations to proceed
+    op.release_lock_index = op.held_locks.size() - 1;  // Start from LAST lock (leaf)
     op.waiting_for_release_ll = true;
     
-    // Initiate release of first lock (pass old_req_id so it can be erased)
+    // Initiate release of first lock (actually the LAST acquired lock - the leaf)
     release_single_lock_async(old_req_id, op, interface_getter, pending_ops);
 }
 
@@ -311,7 +315,9 @@ void BTreeLockManager::release_single_lock_async(
     std::function<SST::Interfaces::StandardMem*(uint64_t)> interface_getter,
     std::map<SST::Interfaces::StandardMem::Request::id_t, AsyncOperation>& pending_ops) {
     
-    if (op.release_lock_index >= op.held_locks.size()) {
+    // Check if all locks have been released
+    // Note: release_lock_index starts at held_locks.size()-1 and decrements to -1
+    if (op.release_lock_index < 0) {
         // All locks released!
         if (verbose_level_ >= 2 && out_) {
             out_->output("   ✓ All %zu locks released\n", op.held_locks.size());
@@ -326,9 +332,11 @@ void BTreeLockManager::release_single_lock_async(
     bool is_exclusive = op.held_locks_exclusive[op.release_lock_index];
     
     if (verbose_level_ >= 3 && out_) {
-        out_->output("      Releasing %s lock on 0x%lx (lock %u/%zu)\n",
+        // Display position in reverse: lock 1/N is the last lock (leaf)
+        uint32_t display_position = op.held_locks.size() - op.release_lock_index;
+        out_->output("      Releasing %s lock on 0x%lx (lock %u/%zu, bottom-to-top)\n",
                     is_exclusive ? "EXCLUSIVE" : "SHARED", lock_addr,
-                    op.release_lock_index + 1, op.held_locks.size());
+                    display_position, op.held_locks.size());
     }
     
     // Use LoadLink to read current lock state atomically
@@ -435,7 +443,8 @@ void BTreeLockManager::handle_release_storeconditional_response(
     SST::Interfaces::StandardMem::Request::id_t req_id,
     SST::Interfaces::StandardMem::WriteResp* resp,
     std::map<SST::Interfaces::StandardMem::Request::id_t, AsyncOperation>& pending_ops,
-    std::function<SST::Interfaces::StandardMem*(uint64_t)> interface_getter) {
+    std::function<SST::Interfaces::StandardMem*(uint64_t)> interface_getter,
+    uint64_t restart_signal_address) {
     
     auto it = pending_ops.find(req_id);
     if (it == pending_ops.end()) {
@@ -476,11 +485,12 @@ void BTreeLockManager::handle_release_storeconditional_response(
                     is_exclusive ? "EXCLUSIVE" : "SHARED", lock_addr);
     }
     
-    // Move to next lock
-    op.release_lock_index++;
+    // Move to next lock (decrement to release in reverse order - bottom to top)
+    op.release_lock_index--;
     op.waiting_for_release_sc = false;
     
-    if (op.release_lock_index < op.held_locks.size()) {
+    // Check if more locks remain (index goes from size-1 down to 0, then -1 means done)
+    if (op.release_lock_index >= 0) {
         // More locks to release
         op.waiting_for_release_ll = true;
         auto old_req_id = it->first;
@@ -488,17 +498,45 @@ void BTreeLockManager::handle_release_storeconditional_response(
         pending_ops.erase(it);  // Remove current request ID (invalidates 'op' reference)
         release_single_lock_async(0, next_op, interface_getter, pending_ops);
     } else {
-        // All locks released! Operation can now complete
+        // All locks released! 
         if (verbose_level_ >= 2 && out_) {
-            out_->output("   ✓ All %zu locks released successfully, operation complete\n", op.held_locks.size());
+            out_->output("   ✓ All %zu locks released successfully\n", op.held_locks.size());
         }
         op.held_locks.clear();
         op.held_locks_exclusive.clear();
         op.waiting_for_release_ll = false;
-        // ready_to_complete remains TRUE - computeServer will finalize in tick()
         
-        // Operation stays in pending_ops with ready_to_complete=true, 
-        // will be finalized and erased by computeServer in tick()
+        // Check if this operation should restart after lock release
+        if (op.restart_pending) {
+            if (verbose_level_ >= 2 && out_) {
+                out_->output("   🔄 Locks released, triggering restart by writing to RESTART_SIGNAL_ADDRESS\n");
+            }
+            
+            // Mark operation type as RESTART_SIGNAL so computeServer knows to restart it
+            op.type = AsyncOperation::RESTART_SIGNAL;
+            
+            // Trigger restart by writing to special RESTART_SIGNAL_ADDRESS
+            // This will invoke the write response handler in computeServer
+            // which will detect the RESTART_SIGNAL type and start the new operation
+            std::vector<uint8_t> signal_data(8, 0);  // Dummy data
+            auto write_req = new SST::Interfaces::StandardMem::Write(
+                restart_signal_address, 8, signal_data);
+            auto write_req_id = write_req->getID();
+            
+            // Update operation in pending_ops before sending write
+            pending_ops[write_req_id] = op;
+            pending_ops.erase(it);  // Remove old req_id
+            
+            // Send write to trigger restart handler
+            SST::Interfaces::StandardMem* restart_interface = interface_getter(restart_signal_address);
+            restart_interface->send(write_req);
+            
+        } else {
+            // Normal completion path
+            op.ready_to_complete = true;
+            // Operation stays in pending_ops with ready_to_complete=true, 
+            // will be finalized and erased by computeServer in tick()
+        }
     }
 }
 
